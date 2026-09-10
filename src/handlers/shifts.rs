@@ -11,11 +11,12 @@ use crate::{
     models::shift::{
         AcceptShiftRequest, ClockinApprovalDecisionRequest, ClockinApprovalRequest, ClockinRequest,
         ClockinResponse, ClockoutResponse, CreateShiftRequest, DeclineShiftRequest,
-        EditRatingRequest, HandoverResponse, HandoverRevisionRequest, MyApplicationEntry,
-        NearbyShiftCard, RankedInterestedClinician, RateHospitalRequest, RateWorkerRequest,
+        EditRatingRequest, HandoverAppealRequest, HandoverResponse, HandoverRevisionRequest,
+        MyApplicationEntry,
+        NearbyShiftsResponse, RankedInterestedClinician, RateHospitalRequest, RateWorkerRequest,
         RatingResponse, Shift, ShiftApplication, ShiftApplicationRequest, ShiftApplicationsQuery,
         ShiftDetailResponse,
-        ShiftAssignRequest, ShiftCancelRequest, ShiftInterestRequest, ShiftListQuery,
+        ShiftAssignRequest, ShiftCancelRequest, ShiftListQuery,
         ShiftOfferRequest, ShiftOfferResponse, ShiftRescheduleRequest, SubmitHandoverRequest,
     },
     routes::AppState,
@@ -244,32 +245,32 @@ pub async fn get_shift(
 #[utoipa::path(
     post,
     path = "/api/v1/shifts/{shift_id}/interest",
-    request_body = ShiftInterestRequest,
     params(
         ("shift_id" = Uuid, Path, description = "Shift unique identifier")
     ),
     responses(
         (status = 201, description = "Interest recorded"),
+        (status = 401, description = "Missing or invalid token", body = ErrorResponse),
+        (status = 403, description = "Caller has no clinician profile", body = ErrorResponse),
         (status = 404, description = "Shift not found", body = ErrorResponse),
-        (status = 409, description = "Interest already exists, or shift is no longer available", body = ErrorResponse),
-        (status = 422, description = "Validation error", body = ErrorResponse)
+        (status = 409, description = "Interest already exists, or shift is no longer available", body = ErrorResponse)
     ),
     tag = "shifts",
     summary = "Express interest in a shift",
-    description = "Clinician expresses interest in an open shift. The hospital admin is notified. Rejected with 409 if the shift is no longer open (BR: no longer available)."
+    description = "Clinician expresses interest in an open shift. The clinician is taken from the bearer token \u{2014} the request takes no body. The hospital admin is notified. Rejected with 409 if the shift is no longer open (BR: no longer available)."
 )]
 pub async fn express_interest(
     State(state): State<AppState>,
     Path(shift_id): Path<Uuid>,
-    Json(payload): Json<ShiftInterestRequest>,
+    headers: HeaderMap,
 ) -> AppResult<StatusCode> {
-    payload
-        .validate()
-        .map_err(|e| AppError::Validation(e.to_string()))?;
+    let claims = extract_claims(&headers)?;
+    let worker_user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| AppError::Unauthorized("Invalid user ID in token".to_string()))?;
 
     state
         .shift_service
-        .express_interest(shift_id, payload.clinician_id)
+        .express_interest(shift_id, worker_user_id)
         .await
         .map(|_| StatusCode::CREATED)
         .map_err(map_shift_error)
@@ -285,27 +286,33 @@ pub async fn express_interest(
     ),
     responses(
         (status = 201, description = "Application submitted"),
-        (status = 403, description = "Profile incomplete or not allowed", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token", body = ErrorResponse),
+        (status = 403, description = "Profile incomplete, or caller has no clinician profile", body = ErrorResponse),
         (status = 404, description = "Shift not found", body = ErrorResponse),
         (status = 409, description = "Already applied or busy", body = ErrorResponse),
         (status = 422, description = "Validation error", body = ErrorResponse)
     ),
     tag = "shifts",
     summary = "Apply for a shift",
-    description = "Submit a shift application with profile details and experience"
+    description = "Submit a shift application. The clinician is taken from the bearer token; profile details are read from the stored clinician profile. Also records shift interest, so the hospital can offer the shift."
 )]
 pub async fn apply_for_shift(
     State(state): State<AppState>,
     Path(shift_id): Path<Uuid>,
+    headers: HeaderMap,
     Json(payload): Json<ShiftApplicationRequest>,
 ) -> AppResult<StatusCode> {
+    let claims = extract_claims(&headers)?;
+    let worker_user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| AppError::Unauthorized("Invalid user ID in token".to_string()))?;
+
     payload
         .validate()
         .map_err(|e| AppError::Validation(e.to_string()))?;
 
     state
         .shift_service
-        .apply_for_shift(shift_id, payload)
+        .apply_for_shift(shift_id, worker_user_id, payload)
         .await
         .map(|_| StatusCode::CREATED)
         .map_err(map_shift_error)
@@ -595,6 +602,84 @@ pub async fn submit_handover(
         .map_err(map_shift_error)?;
 
     Ok((StatusCode::CREATED, Json(row)))
+}
+
+/// GET /api/v1/shifts/{shift_id}/handover
+#[utoipa::path(
+    get,
+    path = "/api/v1/shifts/{shift_id}/handover",
+    params(
+        ("shift_id" = Uuid, Path, description = "Shift unique identifier"),
+    ),
+    responses(
+        (status = 200, description = "Handover report", body = HandoverResponse),
+        (status = 401, description = "Missing or invalid token", body = ErrorResponse),
+        (status = 403, description = "Not authorized to view this handover", body = ErrorResponse),
+        (status = 404, description = "Shift or handover not found", body = ErrorResponse)
+    ),
+    tag = "shifts",
+    summary = "Get the handover report for a shift",
+    description = "Returns the handover the assigned worker submitted at clock-out. Readable by the owning hospital, a super admin, or the assigned worker."
+)]
+pub async fn get_handover(
+    State(state): State<AppState>,
+    Path(shift_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> AppResult<Json<HandoverResponse>> {
+    let claims = extract_claims(&headers)?;
+    let viewer_user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| AppError::Unauthorized("Invalid user ID in token".to_string()))?;
+    let viewer_hospital_id = claims
+        .hospital_id
+        .as_deref()
+        .and_then(|s| Uuid::parse_str(s).ok());
+
+    let row = state
+        .shift_service
+        .get_handover_for_viewer(shift_id, viewer_user_id, claims.role, viewer_hospital_id)
+        .await
+        .map_err(map_shift_error)?;
+
+    Ok(Json(row))
+}
+
+/// POST /api/v1/shifts/{shift_id}/handover/appeal
+#[utoipa::path(
+    post,
+    path = "/api/v1/shifts/{shift_id}/handover/appeal",
+    params(("shift_id" = Uuid, Path, description = "Shift unique identifier")),
+    request_body = HandoverAppealRequest,
+    responses(
+        (status = 200, description = "Appeal raised; hospital notified", body = HandoverResponse),
+        (status = 401, description = "Missing or invalid token", body = ErrorResponse),
+        (status = 403, description = "Not the assigned worker", body = ErrorResponse),
+        (status = 404, description = "Shift or handover not found", body = ErrorResponse),
+        (status = 409, description = "Too early, already approved, or already appealed", body = ErrorResponse)
+    ),
+    tag = "shifts",
+    summary = "Appeal an unapproved handover",
+    description = "The assigned worker raises a reminder/appeal once the handover has been awaiting hospital approval for more than a day. Records the appeal and emails the hospital."
+)]
+pub async fn appeal_handover(
+    State(state): State<AppState>,
+    Path(shift_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(payload): Json<crate::models::shift::HandoverAppealRequest>,
+) -> AppResult<Json<HandoverResponse>> {
+    payload
+        .validate()
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+    let claims = extract_claims(&headers)?;
+    let worker_user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| AppError::Unauthorized("Invalid user ID in token".to_string()))?;
+
+    let row = state
+        .shift_service
+        .appeal_handover(shift_id, worker_user_id, payload.note)
+        .await
+        .map_err(map_shift_error)?;
+
+    Ok(Json(row))
 }
 
 /// POST /api/v1/shifts/{shift_id}/clockout
@@ -905,11 +990,10 @@ impl NearbyShiftsQuery {
         ("offset" = Option<i64>, Query, description = "Rows to skip (default 0)")
     ),
     responses(
-        (status = 200, description = "Open shifts within the radius, ranked by urgency then distance", body = Vec<NearbyShiftCard>),
+        (status = 200, description = "Open shifts within the radius, ranked by urgency then distance", body = NearbyShiftsResponse),
         (status = 400, description = "Invalid coordinates or paging parameters", body = ErrorResponse),
         (status = 401, body = ErrorResponse),
-        (status = 403, description = "Caller has no clinician profile", body = ErrorResponse),
-        (status = 409, description = "No location supplied and none on file", body = ErrorResponse)
+        (status = 403, description = "Caller has no clinician profile", body = ErrorResponse)
     ),
     tag = "shifts",
     summary = "Shifts Near You (worker discovery)",
@@ -919,19 +1003,22 @@ pub async fn list_nearby_shifts(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<NearbyShiftsQuery>,
-) -> AppResult<Json<Vec<NearbyShiftCard>>> {
+) -> AppResult<Json<NearbyShiftsResponse>> {
     let claims = extract_claims(&headers)?;
     let worker_user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| AppError::Unauthorized("Invalid user ID in token".to_string()))?;
 
     let (origin, radius_km, limit, offset) = query.resolve().map_err(AppError::BadRequest)?;
 
-    let cards = state
+    let result = state
         .shift_service
         .list_nearby_shifts_for_worker(worker_user_id, origin, radius_km, limit, offset)
         .await
         .map_err(map_shift_error)?;
-    Ok(Json(cards))
+    Ok(Json(NearbyShiftsResponse {
+        location_required: result.location_required,
+        shifts: result.shifts,
+    }))
 }
 
 /// GET /api/v1/worker/shifts/my-applications
@@ -1424,6 +1511,12 @@ fn map_shift_error(e: ShiftServiceError) -> AppError {
         }
         ShiftServiceError::OfferAlreadyResponded => {
             AppError::Conflict("This offer has already been responded to".to_string())
+        }
+        ShiftServiceError::HandoverNotFound => {
+            AppError::NotFound("No handover has been submitted for this shift".to_string())
+        }
+        ShiftServiceError::Forbidden => {
+            AppError::Forbidden("Not authorized to view this resource".to_string())
         }
     }
 }

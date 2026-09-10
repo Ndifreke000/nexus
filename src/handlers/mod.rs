@@ -14,5 +14,7 @@ pub mod patients;
 pub mod pipeline;
 pub mod registration;
 pub mod shifts;
+pub mod uploads;
+pub mod video;
 pub mod wallet;
 pub mod webhooks;

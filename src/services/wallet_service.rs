@@ -2,13 +2,16 @@
 
 use std::sync::Arc;
 
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::models::wallet::{Wallet, WalletDepositRequest, WalletLedgerEntry};
+use crate::models::wallet::{
+    DepositInstructions, Wallet, WalletDepositRequest, WalletLedgerEntry, WithdrawResponse,
+    WithdrawalRow,
+};
 use crate::repositories::wallet::{WalletRepoError, WalletRepository};
-use crate::services::safehaven::{SafeHavenClient, SafeHavenError};
+use crate::services::safehaven::{SafeHavenClient, SafeHavenError, TransferStatus};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WalletServiceError {
@@ -176,11 +179,17 @@ impl WalletService {
 
     /// Mint a one-shot virtual account at SafeHaven and record a pending deposit
 
-    pub async fn request_deposit(
+    /// Return the hospital's sub-account funding instructions. Hospitals fund
+    /// their wallet by transferring into their dedicated SafeHaven sub-account;
+    /// the inbound `account.credit` webhook then credits `balance_kobo`.
+    ///
+    /// (Per-deposit virtual accounts are unavailable while the SafeHaven account
+    /// is KYC-restricted, so this replaces the old `create_virtual_account` path.)
+    pub async fn deposit_instructions(
         &self,
         hospital_id: Uuid,
         amount_kobo: i64,
-    ) -> Result<WalletDepositRequest, WalletServiceError> {
+    ) -> Result<DepositInstructions, WalletServiceError> {
         if amount_kobo < 100_000 {
             return Err(WalletServiceError::Validation(
                 "Minimum deposit is ₦1,000".to_string(),
@@ -188,64 +197,554 @@ impl WalletService {
         }
 
         self.repo.ensure_wallet_row(hospital_id).await?;
+        let wallet = self
+            .repo
+            .find_wallet(hospital_id)
+            .await?
+            .ok_or(WalletServiceError::WalletNotFound(hospital_id))?;
 
-        let amount_naira = amount_kobo / 100;
-        let external_reference = format!("dep_{}", Uuid::new_v4());
-
-        // Settle into the hospital's sub-account only when we have BOTH a
-        // non-blank bank code and account number; otherwise pass no settlement
-        // override (SafeHaven rejects an empty settlement bank code).
-        let wallet = self.repo.find_wallet(hospital_id).await?;
-        let (settlement_bank, settlement_acct) = wallet
-            .as_ref()
-            .and_then(|w| match (&w.safehaven_bank_code, &w.safehaven_account_number) {
-                (Some(b), Some(a)) if !b.trim().is_empty() && !a.trim().is_empty() => {
-                    Some((Some(b.clone()), Some(a.clone())))
-                }
-                _ => None,
-            })
-            .unwrap_or((None, None));
-
-        let callback = if self.callback_url.trim().is_empty() {
-            // Mock mode tolerates a placeholder URL; real SafeHaven rejects it.
-            if self.safehaven.is_mock() {
-                "https://mock.invalid/webhook".to_string()
-            } else {
+        let account_number = match wallet
+            .safehaven_account_number
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(a) => a.to_string(),
+            None => {
                 return Err(WalletServiceError::Validation(
-                    "SAFEHAVEN_CALLBACK_URL is not configured".to_string(),
-                ));
+                    "No wallet account yet. Create your wallet first.".to_string(),
+                ))
             }
-        } else {
-            self.callback_url.clone()
         };
 
-        let va = self
-            .safehaven
-            .create_virtual_account(
-                amount_naira,
-                self.deposit_validity.num_seconds(),
-                &callback,
-                settlement_bank.as_deref(),
-                settlement_acct.as_deref(),
-                &external_reference,
-            )
-            .await?;
+        Ok(DepositInstructions {
+            account_number,
+            bank_name: "Safe Haven MFB".to_string(),
+            bank_code: wallet.safehaven_bank_code.clone(),
+            account_name: wallet.safehaven_account_name.clone(),
+            amount_kobo,
+            instructions:
+                "Transfer the amount into the account above to fund your wallet. \
+                 Your balance updates automatically once the transfer is received."
+                    .to_string(),
+        })
+    }
 
-        let valid_until = Utc::now() + self.deposit_validity;
-        let row = self
+    /// Withdraw available wallet funds to an external bank account. Validates the
+    /// destination via name-enquiry, atomically debits `balance_kobo` and records
+    /// a pending `withdrawal` billing row + ledger entry, then instructs SafeHaven
+    /// to transfer OUT OF the hospital's own sub-account (where its deposits sit).
+    /// A synchronous transfer rejection fully refunds the debit.
+    /// Estimated SafeHaven outbound transfer fee (kobo) reserved on a withdrawal
+    /// of `amount_kobo`. Set `SAFEHAVEN_TRANSFER_FEE_KOBO` to pin a flat fee;
+    /// otherwise NIP-style tiers are used. Reserve conservatively so the transfer
+    /// has fee headroom — any small over-estimate simply stays in the sub-account.
+    fn withdrawal_fee_kobo(amount_kobo: i64) -> i64 {
+        if let Ok(v) = std::env::var("SAFEHAVEN_TRANSFER_FEE_KOBO") {
+            if let Ok(n) = v.trim().parse::<i64>() {
+                if n >= 0 {
+                    return n;
+                }
+            }
+        }
+        match amount_kobo {
+            x if x <= 500_000 => 1_000,   // ≤ ₦5,000    → ₦10
+            x if x <= 5_000_000 => 2_500, // ₦5,001–₦50,000 → ₦25
+            _ => 5_000,                   // > ₦50,000   → ₦50
+        }
+    }
+
+    pub async fn withdraw(
+        &self,
+        hospital_id: Uuid,
+        amount_kobo: i64,
+        bank_code: &str,
+        account_number: &str,
+        narration: Option<&str>,
+    ) -> Result<WithdrawResponse, WalletServiceError> {
+        if amount_kobo < 10_000 {
+            return Err(WalletServiceError::Validation(
+                "Minimum withdrawal is ₦100".to_string(),
+            ));
+        }
+
+        self.repo.ensure_wallet_row(hospital_id).await?;
+        let wallet = self
             .repo
-            .insert_deposit_request(
+            .find_wallet(hospital_id)
+            .await?
+            .ok_or(WalletServiceError::WalletNotFound(hospital_id))?;
+
+        // Funds are physically held in the hospital's SafeHaven sub-account; a
+        // withdrawal debits that account. No sub-account => nothing to withdraw.
+        let debit_source = wallet
+            .safehaven_account_number
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                WalletServiceError::Validation(
+                    "No wallet account yet. Create your wallet first.".to_string(),
+                )
+            })?;
+
+        // The hospital bears SafeHaven's outbound transfer fee, which SafeHaven
+        // debits from the same sub-account. Reserve it on top of the amount so the
+        // transfer has headroom and the wallet ledger stays consistent with the
+        // sub-account.
+        let fee_kobo = Self::withdrawal_fee_kobo(amount_kobo);
+        let total_debit = amount_kobo + fee_kobo;
+
+        if wallet.balance_kobo < total_debit {
+            return Err(WalletServiceError::Validation(format!(
+                "Insufficient balance: withdrawing ₦{} costs ₦{} including a ₦{} transfer fee, \
+                 but your available balance is ₦{}.",
+                amount_kobo / 100,
+                total_debit / 100,
+                fee_kobo / 100,
+                wallet.balance_kobo / 100
+            )));
+        }
+
+        // Validate the destination up front (also yields the account holder name).
+        let resolved = self.safehaven.name_enquiry(bank_code, account_number).await?;
+
+        // Atomically debit available balance (amount + fee) + record the pending
+        // withdrawal. The guarded UPDATE also protects against a concurrent debit.
+        let mut tx = self.pool.begin().await?;
+        let debited = sqlx::query(
+            r#"
+            UPDATE hospital_wallets
+               SET balance_kobo = balance_kobo - $2,
+                   updated_at   = NOW()
+             WHERE hospital_id = $1 AND balance_kobo >= $2
+            "#,
+        )
+        .bind(hospital_id)
+        .bind(total_debit)
+        .execute(&mut *tx)
+        .await?;
+        if debited.rows_affected() != 1 {
+            tx.rollback().await.ok();
+            return Err(WalletServiceError::Repo(
+                WalletRepoError::InsufficientBalance {
+                    required: total_debit,
+                    available: wallet.balance_kobo,
+                },
+            ));
+        }
+
+        let description = format!(
+            "Wallet withdrawal to {bank_code}/{account_number} (fee ₦{})",
+            fee_kobo / 100
+        );
+        let withdrawal_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO billing_transactions (
+                hospital_id, event_type, amount_kobo, currency, status,
+                provider, description
+            )
+            VALUES ($1, 'withdrawal', $2, 'NGN', 'pending', 'safehaven', $3)
+            RETURNING id
+            "#,
+        )
+        .bind(hospital_id)
+        .bind(amount_kobo)
+        .bind(&description)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        self.repo
+            .insert_ledger_entry_in_tx(
+                &mut tx,
                 hospital_id,
+                "withdrawal_debit",
+                -amount_kobo,
+                0,
+                None,
+                Some(&withdrawal_id.to_string()),
+                Some("wallet withdrawal to bank"),
+            )
+            .await?;
+        if fee_kobo > 0 {
+            self.repo
+                .insert_ledger_entry_in_tx(
+                    &mut tx,
+                    hospital_id,
+                    "withdrawal_fee",
+                    -fee_kobo,
+                    0,
+                    None,
+                    Some(&withdrawal_id.to_string()),
+                    Some("SafeHaven transfer fee"),
+                )
+                .await?;
+        }
+        tx.commit().await?;
+
+        // Instruct SafeHaven to pay out FROM the hospital's sub-account.
+        let payment_reference = withdrawal_id.to_string();
+        let narr = narration.unwrap_or("NexusCare wallet withdrawal");
+
+        match self
+            .safehaven
+            .transfer(
+                bank_code,
+                account_number,
+                amount_kobo / 100,
+                narr,
+                &payment_reference,
+                Some(&debit_source),
+            )
+            .await
+        {
+            Ok(receipt) => {
+                let raw_status = receipt
+                    .raw
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let completed =
+                    matches!(raw_status.as_str(), "completed" | "success" | "successful");
+                let status = if completed { "success" } else { "pending" };
+
+                sqlx::query(
+                    r#"
+                    UPDATE billing_transactions
+                       SET status                  = $2::transaction_status,
+                           provider_reference      = $3,
+                           provider_transaction_id = $4,
+                           completed_at            = CASE WHEN $2 = 'success' THEN NOW() ELSE completed_at END,
+                           updated_at              = NOW()
+                     WHERE id = $1
+                    "#,
+                )
+                .bind(withdrawal_id)
+                .bind(status)
+                .bind(&receipt.payment_reference)
+                .bind(&receipt.session_id)
+                .execute(&self.pool)
+                .await?;
+
+                tracing::info!(
+                    "Withdrawal {} for hospital {} -> ₦{} to {}/{} ({})",
+                    withdrawal_id,
+                    hospital_id,
+                    amount_kobo / 100,
+                    bank_code,
+                    account_number,
+                    status
+                );
+
+                Ok(WithdrawResponse {
+                    withdrawal_id,
+                    amount_kobo,
+                    fee_kobo,
+                    account_number: account_number.to_string(),
+                    account_name: resolved.account_name,
+                    bank_code: bank_code.to_string(),
+                    status: status.to_string(),
+                    reference: receipt.payment_reference,
+                    message: if completed {
+                        "Withdrawal completed.".to_string()
+                    } else {
+                        "Withdrawal is processing; funds will arrive shortly.".to_string()
+                    },
+                })
+            }
+            Err(e) => {
+                // Synchronous rejection — refund the full debit (amount + fee) so
+                // the balance is restored.
+                self.refund_withdrawal(hospital_id, withdrawal_id, total_debit, &e.to_string())
+                    .await?;
+                tracing::error!(
+                    "Withdrawal {} for hospital {} failed at SafeHaven (refunded): {}",
+                    withdrawal_id,
+                    hospital_id,
+                    e
+                );
+                // SafeHaven debits its transfer fee from the same account, so a
+                // withdrawal of the full balance fails for lack of fee headroom.
+                // Surface a clear, actionable message instead of the raw provider
+                // error (balance is already refunded above).
+                if e.to_string().to_lowercase().contains("sufficient fund") {
+                    return Err(WalletServiceError::Validation(format!(
+                        "Withdrawal declined: ₦{} plus SafeHaven's transfer fee exceeds your \
+                         available balance. Try a slightly lower amount.",
+                        amount_kobo / 100
+                    )));
+                }
+                Err(WalletServiceError::SafeHaven(e))
+            }
+        }
+    }
+
+    /// Reverse a committed withdrawal debit and mark the billing row failed, in
+    /// one tx: re-credit `balance_kobo` and write a `withdrawal_reversal` ledger
+    /// entry.
+    async fn refund_withdrawal(
+        &self,
+        hospital_id: Uuid,
+        withdrawal_id: Uuid,
+        amount_kobo: i64,
+        error: &str,
+    ) -> Result<(), WalletServiceError> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            UPDATE billing_transactions
+               SET status      = 'failed',
+                   description = COALESCE(description, '') || E'\nError: ' || $2,
+                   updated_at  = NOW()
+             WHERE id = $1
+            "#,
+        )
+        .bind(withdrawal_id)
+        .bind(error)
+        .execute(&mut *tx)
+        .await?;
+
+        self.repo
+            .insert_ledger_entry_in_tx(
+                &mut tx,
+                hospital_id,
+                "withdrawal_reversal",
                 amount_kobo,
-                &va.account_number,
-                va.bank_code.as_deref(),
-                va.account_name.as_deref(),
-                valid_until,
-                &external_reference,
+                0,
+                None,
+                Some(&withdrawal_id.to_string()),
+                Some("withdrawal re-credited after failed transfer"),
             )
             .await?;
 
-        Ok(row)
+        sqlx::query(
+            r#"
+            UPDATE hospital_wallets
+               SET balance_kobo = balance_kobo + $2,
+                   updated_at   = NOW()
+             WHERE hospital_id = $1
+            "#,
+        )
+        .bind(hospital_id)
+        .bind(amount_kobo)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// List a hospital's withdrawals (newest first).
+    pub async fn list_withdrawals(
+        &self,
+        hospital_id: Uuid,
+        page: i64,
+        page_size: i64,
+    ) -> Result<(Vec<WithdrawalRow>, i64), WalletServiceError> {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 200);
+        let offset = (page - 1) * page_size;
+
+        let rows = sqlx::query_as::<_, WithdrawalRow>(
+            r#"
+            SELECT id, amount_kobo, status::text AS status, provider_reference,
+                   provider_transaction_id, description, created_at, completed_at
+            FROM billing_transactions
+            WHERE hospital_id = $1 AND event_type = 'withdrawal'
+            ORDER BY created_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(hospital_id)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM billing_transactions WHERE hospital_id = $1 AND event_type = 'withdrawal'",
+        )
+        .bind(hospital_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok((rows, total))
+    }
+
+    /// Refresh a pending withdrawal's status from SafeHaven, settling it
+    /// (success, or failed + refund) as appropriate. Scoped to the caller's
+    /// hospital. Returns the current stored status string.
+    pub async fn refresh_withdrawal_status(
+        &self,
+        hospital_id: Uuid,
+        withdrawal_id: Uuid,
+    ) -> Result<String, WalletServiceError> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            r#"SELECT status::text, provider_reference
+               FROM billing_transactions
+               WHERE id = $1 AND hospital_id = $2 AND event_type = 'withdrawal'"#,
+        )
+        .bind(withdrawal_id)
+        .bind(hospital_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let (status, provider_reference) = match row {
+            Some(r) => r,
+            None => return Ok("not_found".to_string()),
+        };
+        if status != "pending" {
+            return Ok(status);
+        }
+        // We always send the withdrawal id as SafeHaven's paymentReference, so
+        // fall back to it if provider_reference wasn't persisted.
+        let reference = provider_reference
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or_else(|| withdrawal_id.to_string());
+
+        match self.safehaven.transfer_status(&reference).await? {
+            TransferStatus::Completed => {
+                sqlx::query(
+                    r#"UPDATE billing_transactions
+                          SET status = 'success', completed_at = NOW(), updated_at = NOW()
+                        WHERE id = $1 AND status = 'pending'"#,
+                )
+                .bind(withdrawal_id)
+                .execute(&self.pool)
+                .await?;
+                Ok("success".to_string())
+            }
+            TransferStatus::Failed | TransferStatus::Cancelled => {
+                let amount_kobo: i64 = sqlx::query_scalar(
+                    "SELECT amount_kobo FROM billing_transactions WHERE id = $1",
+                )
+                .bind(withdrawal_id)
+                .fetch_one(&self.pool)
+                .await?;
+                self.refund_withdrawal(
+                    hospital_id,
+                    withdrawal_id,
+                    amount_kobo,
+                    "transfer reported failed by SafeHaven",
+                )
+                .await?;
+                Ok("failed".to_string())
+            }
+            // Created/Initiated/Processing/Unknown → still in flight.
+            _ => Ok("pending".to_string()),
+        }
+    }
+
+    /// Reconcile the hospital's wallet against SafeHaven: pull the sub-account's
+    /// transaction history and credit any inbound transfer that was never
+    /// received via webhook (e.g. a webhook posted to a stale callback URL).
+    /// Idempotent — transfers already credited (matched by reference, or by the
+    /// webhook-event dedup inside `process_webhook`) are skipped.
+    pub async fn reconcile_deposits(
+        &self,
+        hospital_id: Uuid,
+    ) -> Result<ReconcileResult, WalletServiceError> {
+        self.repo.ensure_wallet_row(hospital_id).await?;
+        let wallet = self
+            .repo
+            .find_wallet(hospital_id)
+            .await?
+            .ok_or(WalletServiceError::WalletNotFound(hospital_id))?;
+
+        let account_id = wallet
+            .safehaven_account_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                WalletServiceError::Validation(
+                    "No wallet account yet. Create your wallet first.".to_string(),
+                )
+            })?
+            .to_string();
+        let sub_account_number = wallet.safehaven_account_number.clone().unwrap_or_default();
+
+        let body = self
+            .safehaven
+            .list_transfers(&account_id, 0, 100, None)
+            .await?;
+        let txns = body
+            .get("data")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut scanned = 0i64;
+        let mut credited = 0i64;
+        let mut credited_kobo = 0i64;
+
+        for tx in txns {
+            // Only inbound (credit) transfers.
+            let dir = tx.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if !dir.eq_ignore_ascii_case("Inwards") {
+                continue;
+            }
+            scanned += 1;
+
+            // Skip transfers already credited (matched on any known reference).
+            let refs: Vec<String> = ["paymentReference", "sessionId", "_id", "reference"]
+                .iter()
+                .filter_map(|k| tx.get(*k).and_then(|v| v.as_str()))
+                .map(str::to_string)
+                .collect();
+            if !refs.is_empty() {
+                let exists: Option<i32> = sqlx::query_scalar(
+                    "SELECT 1 FROM wallet_deposit_requests WHERE external_reference = ANY($1) LIMIT 1",
+                )
+                .bind(&refs)
+                .fetch_optional(&self.pool)
+                .await?;
+                if exists.is_some() {
+                    continue;
+                }
+            }
+
+            // Replay through the webhook pipeline (idempotent via webhook_events).
+            // Inject the credited account so the inflow maps back to this hospital.
+            let mut data_obj = tx.clone();
+            if let Some(obj) = data_obj.as_object_mut() {
+                obj.insert(
+                    "creditAccountNumber".to_string(),
+                    serde_json::Value::String(sub_account_number.clone()),
+                );
+            }
+            let payload = serde_json::json!({ "type": "transfer", "data": data_obj });
+            match self.process_webhook(&payload).await {
+                Ok(WebhookOutcome::DepositCredited { amount_kobo, .. }) => {
+                    credited += 1;
+                    credited_kobo += amount_kobo;
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("reconcile: failed to credit a transfer: {e}"),
+            }
+        }
+
+        let balance_kobo = self
+            .repo
+            .find_wallet(hospital_id)
+            .await?
+            .map(|w| w.balance_kobo)
+            .unwrap_or(0);
+
+        tracing::info!(
+            "Reconcile hospital {}: scanned {} inbound, credited {} (₦{})",
+            hospital_id,
+            scanned,
+            credited,
+            credited_kobo / 100
+        );
+
+        Ok(ReconcileResult {
+            transactions_scanned: scanned,
+            deposits_credited: credited,
+            amount_credited_kobo: credited_kobo,
+            balance_kobo,
+        })
     }
 
     pub async fn try_hold_in_tx(
@@ -280,13 +779,22 @@ impl WalletService {
         &self,
         payload: &serde_json::Value,
     ) -> Result<WebhookOutcome, WalletServiceError> {
-        let event_id = payload
-            .get("data")
-            .and_then(|d| d.get("_id"))
-            .or_else(|| payload.get("data").and_then(|d| d.get("sessionId")))
-            .and_then(|v| v.as_str());
+        // Idempotency id: prefer the transaction id / sessionId / paymentReference,
+        // looked up at top level or under `data` (SafeHaven nests transaction
+        // details under `data`).
+        let event_id = first_str(
+            payload,
+            &["_id", "sessionId", "paymentReference"],
+        )
+        .or_else(|| {
+            payload
+                .get("data")
+                .and_then(|d| first_str(d, &["_id", "sessionId", "paymentReference"]))
+        });
+        // SafeHaven sends the event under `eventType`; accept `type`/`event` too.
         let event_type = payload
-            .get("type")
+            .get("eventType")
+            .or_else(|| payload.get("type"))
             .or_else(|| payload.get("event"))
             .and_then(|v| v.as_str());
 
@@ -299,16 +807,30 @@ impl WalletService {
             None => return Ok(WebhookOutcome::AlreadySeen),
         };
 
+        // SafeHaven's real inbound-credit event is `type: "transfer"` with
+        // `data.type: "Inwards"` (confirmed from a live capture); `account.credit`
+        // / `virtualAccount.transfer` / `subaccount.inflow` are kept defensively.
+        let data_dir = payload
+            .get("data")
+            .and_then(|d| d.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let result = match event_type {
             Some("virtualAccount.transfer") | Some("transfer.inflow") => {
                 self.handle_virtual_account_transfer(payload).await
             }
-            Some("subaccount.inflow") => self.handle_subaccount_inflow(payload).await,
+            Some("account.credit") | Some("subaccount.inflow") => {
+                self.handle_subaccount_inflow(payload).await
+            }
+            // Generic transfer: only credit inbound ("Inwards") transfers.
+            Some("transfer") if data_dir.eq_ignore_ascii_case("Inwards") => {
+                self.handle_subaccount_inflow(payload).await
+            }
             _ => {
                 tracing::info!(
-                    "SafeHaven webhook ignored (event_type={:?}): {}",
+                    "SafeHaven webhook ignored (event_type={:?}, data.type={:?})",
                     event_type,
-                    payload
+                    data_dir
                 );
                 Ok(WebhookOutcome::Ignored)
             }
@@ -421,20 +943,31 @@ impl WalletService {
         &self,
         payload: &serde_json::Value,
     ) -> Result<WebhookOutcome, WalletServiceError> {
-        let data = payload
-            .get("data")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let dest_account = data
-            .get("creditAccountNumber")
-            .or_else(|| data.get("destinationAccountNumber"))
+        // Only credit on a successful/completed transfer.
+        let status = nested_or_top(payload, &["status"])
             .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let amount_naira = data.get("amount").and_then(|v| v.as_i64()).unwrap_or(0);
-        if amount_naira <= 0 || dest_account.is_none() {
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(status.as_str(), "completed" | "success" | "successful") {
+            return Ok(WebhookOutcome::Ignored);
+        }
+
+        let dest_account = nested_or_top(
+            payload,
+            &["creditAccountNumber", "destinationAccountNumber", "accountNumber"],
+        )
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+        let amount_kobo = nested_or_top(payload, &["amount"])
+            .map(amount_to_kobo)
+            .unwrap_or(0);
+
+        if amount_kobo <= 0 || dest_account.is_none() {
             return Ok(WebhookOutcome::Ignored);
         }
         let dest_account = dest_account.unwrap();
+
         let hospital_id: Option<Uuid> = sqlx::query_scalar(
             r#"SELECT hospital_id FROM hospital_wallets
                WHERE safehaven_account_number = $1 LIMIT 1"#,
@@ -448,13 +981,15 @@ impl WalletService {
             None => return Ok(WebhookOutcome::Ignored),
         };
 
-        let amount_kobo = amount_naira * 100;
-        let provider_reference = data
-            .get("paymentReference")
-            .or_else(|| data.get("reference"))
-            .and_then(|v| v.as_str());
+        let provider_reference =
+            nested_or_top(payload, &["paymentReference", "reference", "sessionId"])
+                .and_then(|v| v.as_str());
+        let sender_name =
+            nested_or_top(payload, &["debitAccountName", "senderName", "originatorName"])
+                .and_then(|v| v.as_str());
 
         let mut tx = self.pool.begin().await?;
+
         sqlx::query(
             r#"
             INSERT INTO hospital_wallets (hospital_id, balance_kobo)
@@ -468,6 +1003,7 @@ impl WalletService {
         .bind(amount_kobo)
         .execute(&mut *tx)
         .await?;
+
         self.repo
             .insert_ledger_entry_in_tx(
                 &mut tx,
@@ -477,17 +1013,56 @@ impl WalletService {
                 0,
                 None,
                 provider_reference,
-                Some("direct sub-account inflow"),
+                Some("sub-account inflow"),
             )
             .await?;
+
+        // Record a deposit-history row so GET /wallet/deposits shows top-ups.
+        // External reference must be unique; use the provider ref (fallback uuid).
+        let external_reference = provider_reference
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("inflow_{}", Uuid::new_v4()));
+        let deposit_id = self
+            .repo
+            .insert_received_deposit(
+                &mut tx,
+                hospital_id,
+                amount_kobo,
+                &dest_account,
+                sender_name,
+                &external_reference,
+                payload,
+            )
+            .await?;
+
         tx.commit().await?;
 
+        tracing::info!(
+            "Wallet credited: hospital {} <- ₦{} (sub-account inflow {})",
+            hospital_id,
+            amount_kobo / 100,
+            external_reference
+        );
+
         Ok(WebhookOutcome::DepositCredited {
-            deposit_id: Uuid::nil(),
+            deposit_id,
             hospital_id,
             amount_kobo,
         })
     }
+}
+
+/// Result of a deposit reconcile against SafeHaven's transaction history.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct ReconcileResult {
+    /// Inbound transactions examined.
+    pub transactions_scanned: i64,
+    /// Previously-missed deposits credited during this run.
+    pub deposits_credited: i64,
+    /// Total kobo credited during this run.
+    pub amount_credited_kobo: i64,
+    /// Wallet balance after reconciling.
+    pub balance_kobo: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -499,4 +1074,52 @@ pub enum WebhookOutcome {
         hospital_id: Uuid,
         amount_kobo: i64,
     },
+}
+
+/// Return the first present, non-empty string among `keys` on a JSON object.
+fn first_str<'a>(v: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    for &k in keys {
+        if let Some(s) = v.get(k).and_then(|x| x.as_str()) {
+            if !s.trim().is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// Look up a field on the payload, checking `data.<key>` first then top level.
+fn nested_or_top<'a>(
+    payload: &'a serde_json::Value,
+    keys: &[&str],
+) -> Option<&'a serde_json::Value> {
+    if let Some(data) = payload.get("data") {
+        for &k in keys {
+            if let Some(val) = data.get(k) {
+                if !val.is_null() {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    for &k in keys {
+        if let Some(val) = payload.get(k) {
+            if !val.is_null() {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+/// Convert a SafeHaven amount to kobo. SafeHaven sends transfer amounts in
+/// naira (possibly a decimal like `50` or `50.00`), so multiply by 100. Accepts
+/// numeric or string JSON.
+fn amount_to_kobo(v: &serde_json::Value) -> i64 {
+    let naira = match v {
+        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    };
+    (naira * 100.0).round() as i64
 }

@@ -168,6 +168,8 @@ pub struct ResolveDisputeRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema, FromRow)]
 pub struct PlatformSettings {
     pub platform_fee_percent: f64,
+    /// Max fee taken per payout in kobo; NULL = no cap.
+    pub platform_fee_cap_kobo: Option<i64>,
     pub worker_broadcast_radius_km: f64,
     pub stat_bonus_percent: f64,
     pub urgent_bonus_percent: f64,
@@ -185,6 +187,7 @@ pub struct PlatformSettings {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdatePlatformSettings {
     pub platform_fee_percent: Option<f64>,
+    pub platform_fee_cap_kobo: Option<i64>,
     pub worker_broadcast_radius_km: Option<f64>,
     pub stat_bonus_percent: Option<f64>,
     pub urgent_bonus_percent: Option<f64>,

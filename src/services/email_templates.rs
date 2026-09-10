@@ -399,6 +399,40 @@ pub fn handover_auto_approved(clinician_first_name: &str, role_title: &str) -> E
     }
 }
 
+/// Sent to the hospital when a worker appeals an unapproved handover after a day.
+pub fn handover_appeal_raised(role_title: &str, note: Option<&str>) -> EmailContent {
+    let subject = "Handover Awaiting Your Approval - NexusCare".to_string();
+    let note_line = note
+        .filter(|n| !n.trim().is_empty())
+        .map(|n| format!("\nWorker's note: {n}\n"))
+        .unwrap_or_default();
+    let text_body = format!(
+        "Hello,\n\nThe worker for the {} shift is asking you to review and approve their submitted handover. It has been awaiting approval for over a day.\n{}\nPlease approve it, or it will be auto-approved 48 hours after submission.\n\nNexusCare",
+        role_title, note_line
+    );
+    let note_html = note
+        .filter(|n| !n.trim().is_empty())
+        .map(|n| format!("<p style=\"margin:0 0 12px 0;\"><em>Worker's note: {n}</em></p>"))
+        .unwrap_or_default();
+    let html_body = wrap_html(
+        "Handover Awaiting Your Approval",
+        &format!(
+            "<p style=\"margin:0 0 12px 0;\">Hello,</p>
+             <p style=\"margin:0 0 12px 0;\">The worker for the <strong>{}</strong> shift is asking you to review and approve their submitted handover. It has been awaiting approval for over a day.</p>
+             {}
+             <p style=\"margin:0 0 12px 0;\">Please approve it, or it will be auto-approved 48 hours after submission.</p>
+             <p style=\"margin:0;\">NexusCare</p>",
+            role_title, note_html
+        ),
+    );
+
+    EmailContent {
+        subject,
+        text_body,
+        html_body,
+    }
+}
+
 /// Sent to the hospital when a shift offer to a clinician expires
 
 pub fn shift_offer_expired(role_title: &str) -> EmailContent {

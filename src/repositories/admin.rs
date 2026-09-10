@@ -346,6 +346,7 @@ impl AdminRepository {
             r#"
             SELECT
                 platform_fee_percent::DOUBLE PRECISION        AS platform_fee_percent,
+                platform_fee_cap_kobo,
                 worker_broadcast_radius_km::DOUBLE PRECISION  AS worker_broadcast_radius_km,
                 stat_bonus_percent::DOUBLE PRECISION          AS stat_bonus_percent,
                 urgent_bonus_percent::DOUBLE PRECISION        AS urgent_bonus_percent,
@@ -385,7 +386,8 @@ impl AdminRepository {
                 max_active_shifts_per_hospital = COALESCE($9, max_active_shifts_per_hospital),
                 min_hourly_rate_kobo        = COALESCE($10, min_hourly_rate_kobo),
                 max_recording_minutes       = COALESCE($11, max_recording_minutes),
-                updated_by = $12,
+                platform_fee_cap_kobo       = COALESCE($12, platform_fee_cap_kobo),
+                updated_by = $13,
                 updated_at = NOW()
             WHERE singleton = 'global'
             "#,
@@ -401,6 +403,7 @@ impl AdminRepository {
         .bind(p.max_active_shifts_per_hospital)
         .bind(p.min_hourly_rate_kobo)
         .bind(p.max_recording_minutes)
+        .bind(p.platform_fee_cap_kobo)
         .bind(updated_by)
         .execute(&self.pool)
         .await?;

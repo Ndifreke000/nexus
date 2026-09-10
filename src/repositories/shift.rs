@@ -192,7 +192,8 @@ impl ShiftRepository {
                 c.id                                                  AS clinician_id,
                 c.first_name,
                 c.last_name,
-                c.rating,
+                -- `clinicians.rating` is NUMERIC(3,1); the row decodes it as f32.
+                c.rating::REAL                                        AS rating,
                 c.rating_count,
                 (SELECT COUNT(*) FROM shifts s2
                     WHERE s2.assigned_clinician_id = c.id AND s2.status = 'completed') AS completed_shifts,
@@ -507,6 +508,67 @@ impl ShiftRepository {
         Ok(id)
     }
 
+    /// Idempotent clock-in for the LiveKit `participant_joined` path. Unlike
+    /// `record_clockin_tx`, an existing clock-in is NEVER overwritten: a rejoin
+    /// after a dropped connection must not reset `clockin_at` / `late_minutes`
+    /// and so shorten the worker's paid hours. The guard is in the same
+    /// statement as the write, because two webhook deliveries processed
+    /// concurrently would both pass a read-then-write check.
+    ///
+    /// Returns `None` when a clock-in already existed.
+    pub async fn record_clockin_if_absent_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        shift_id: Uuid,
+        clinician_id: Uuid,
+        method: &crate::models::shift::ClockinMethod,
+        late_minutes: i32,
+        late_penalty_applied: bool,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        let id: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            INSERT INTO shift_attendance
+                (shift_id, clinician_id, clockin_at, clockin_method,
+                 late_minutes, late_penalty_applied)
+            VALUES ($1, $2, NOW(), $3, $4, $5)
+            ON CONFLICT (shift_id) DO UPDATE
+               SET clockin_at           = NOW(),
+                   clockin_method       = EXCLUDED.clockin_method,
+                   late_minutes         = EXCLUDED.late_minutes,
+                   late_penalty_applied = EXCLUDED.late_penalty_applied,
+                   updated_at           = NOW()
+             WHERE shift_attendance.clockin_at IS NULL   -- first write wins, always
+            RETURNING id
+            "#,
+        )
+        .bind(shift_id)
+        .bind(clinician_id)
+        .bind(method)
+        .bind(late_minutes)
+        .bind(late_penalty_applied)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        if id.is_some() {
+            // Guarded so a stray join after clock-out can never resurrect a
+            // completed shift into 'in_progress'.
+            sqlx::query(
+                r#"
+                UPDATE shifts
+                   SET status     = 'in_progress',
+                       updated_at = NOW()
+                 WHERE id = $1
+                   AND status IN ('assigned', 'upcoming')
+                "#,
+            )
+            .bind(shift_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+
+        Ok(id)
+    }
+
     /// Upsert a handover row for the given shift.
 
     pub async fn upsert_handover(
@@ -517,16 +579,17 @@ impl ShiftRepository {
         pending_tasks: &serde_json::Value,
         instructions: &str,
         equipment_status: Option<&str>,
+        image_urls: &serde_json::Value,
     ) -> Result<crate::models::shift::HandoverResponse, sqlx::Error> {
         sqlx::query_as::<_, crate::models::shift::HandoverResponse>(
             r#"
             INSERT INTO shift_handovers (
                 shift_id, patients_seen, critical_patients, pending_tasks,
-                instructions, equipment_status,
+                instructions, equipment_status, image_urls,
                 submitted_at, editable_until, auto_approve_after
             )
             VALUES (
-                $1, $2, $3, $4, $5, $6,
+                $1, $2, $3, $4, $5, $6, $7,
                 NOW(), NOW() + INTERVAL '1 hour', NOW() + INTERVAL '48 hours'
             )
             ON CONFLICT (shift_id) DO UPDATE
@@ -535,12 +598,14 @@ impl ShiftRepository {
                   pending_tasks     = EXCLUDED.pending_tasks,
                   instructions      = EXCLUDED.instructions,
                   equipment_status  = EXCLUDED.equipment_status,
+                  image_urls        = EXCLUDED.image_urls,
                   updated_at        = NOW()
             RETURNING
                 id, shift_id, patients_seen, critical_patients, pending_tasks,
-                instructions, equipment_status,
+                instructions, equipment_status, image_urls,
                 submitted_at, editable_until, auto_approve_after,
-                hospital_approved_at, revision_requested_at, revision_notes
+                hospital_approved_at, revision_requested_at, revision_notes,
+                appeal_raised_at, appeal_note
             "#,
         )
         .bind(shift_id)
@@ -549,6 +614,7 @@ impl ShiftRepository {
         .bind(pending_tasks)
         .bind(instructions)
         .bind(equipment_status)
+        .bind(image_urls)
         .fetch_one(&self.pool)
         .await
     }
@@ -562,14 +628,42 @@ impl ShiftRepository {
         sqlx::query_as::<_, crate::models::shift::HandoverResponse>(
             r#"
             SELECT id, shift_id, patients_seen, critical_patients, pending_tasks,
-                   instructions, equipment_status,
+                   instructions, equipment_status, image_urls,
                    submitted_at, editable_until, auto_approve_after,
-                   hospital_approved_at, revision_requested_at, revision_notes
+                   hospital_approved_at, revision_requested_at, revision_notes,
+                   appeal_raised_at, appeal_note
             FROM shift_handovers
             WHERE shift_id = $1
             "#,
         )
         .bind(shift_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Record a worker's handover appeal. Only succeeds when the handover was
+    /// submitted more than a day ago, is not yet approved, and hasn't already
+    /// been appealed. Returns the row id, or None if a guard blocked it.
+    pub async fn raise_handover_appeal(
+        &self,
+        shift_id: Uuid,
+        note: Option<&str>,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar::<_, Uuid>(
+            r#"
+            UPDATE shift_handovers
+               SET appeal_raised_at = NOW(),
+                   appeal_note      = $2,
+                   updated_at       = NOW()
+             WHERE shift_id = $1
+               AND hospital_approved_at IS NULL
+               AND appeal_raised_at IS NULL
+               AND submitted_at <= NOW() - INTERVAL '1 day'
+            RETURNING id
+            "#,
+        )
+        .bind(shift_id)
+        .bind(note)
         .fetch_optional(&self.pool)
         .await
     }
@@ -858,12 +952,17 @@ impl ShiftRepository {
     pub async fn list_nearby_shifts(
         &self,
         clinician_id: Uuid,
-        origin_lat: f64,
-        origin_lng: f64,
+        origin: Option<(f64, f64)>,
         radius_km: f64,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<NearbyShiftRow>, sqlx::Error> {
+        // Split the optional origin into nullable binds; the `$2::double
+        // precision` casts in the CTE handle NULL binds correctly.
+        let (origin_lat, origin_lng) = match origin {
+            Some((lat, lng)) => (Some(lat), Some(lng)),
+            None => (None, None),
+        };
         sqlx::query_as::<_, NearbyShiftRow>(
             r#"
             WITH origin AS (
@@ -876,11 +975,11 @@ impl ShiftRepository {
                 h.name            AS hospital_name,
                 s.role_title,
                 s.specialty,
-                s.shift_type      AS "shift_type: _",
-                s.priority        AS "priority: _",
+                s.shift_type,
+                s.priority,
                 s.scheduled_start,
                 s.duration_hours,
-                s.pay_type        AS "pay_type: _",
+                s.pay_type,
                 s.rate_kobo_per_hour,
                 s.fixed_rate_kobo,
                 s.stat_bonus_kobo,
@@ -977,7 +1076,7 @@ impl ShiftRepository {
         .bind(latitude)
         .bind(longitude)
         .bind(accuracy_meters)
-        .fetch_optional(&self.pool)
+        .execute(&self.pool)
         .await
         .map(|_| ())
     }
@@ -1019,7 +1118,7 @@ impl ShiftRepository {
         >(
             r#"
             SELECT s.id, s.hospital_id, s.role_title, s.scheduled_start,
-                   s.status AS "status: _", si.expressed_at AS created_at
+                   s.status, si.expressed_at AS created_at
             FROM shift_interests si
             JOIN shifts s ON s.id = si.shift_id
             WHERE si.clinician_id = $1
@@ -1043,8 +1142,8 @@ impl ShiftRepository {
         >(
             r#"
             SELECT s.id, s.hospital_id, s.role_title, s.scheduled_start,
-                   s.status AS "status: _",
-                   a.status AS "app_status: _",
+                   s.status,
+                   a.status,
                    a.created_at
             FROM shift_applications a
             JOIN shifts s ON s.id = a.shift_id
@@ -1589,12 +1688,12 @@ impl ShiftRepository {
                 pay_type, rate_kobo_per_hour, fixed_rate_kobo, stat_bonus_kobo,
                 effective_rate_kobo_per_hour, grand_total_kobo,
                 shift_label, job_description, notes, created_by, broadcast_consent_confirmed,
-                created_at, updated_at
+                attachment_urls, created_at, updated_at
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17, $18, $19,
-                $20, $21, $22, $23, $24, NOW(), NOW()
+                $20, $21, $22, $23, $24, $25, NOW(), NOW()
             )
             "#,
         )
@@ -1622,6 +1721,13 @@ impl ShiftRepository {
         .bind(&request.notes)
         .bind(created_by)
         .bind(request.broadcast_consent_confirmed)
+        .bind(serde_json::Value::Array(
+            request
+                .attachment_urls
+                .iter()
+                .map(|u| serde_json::Value::String(u.clone()))
+                .collect(),
+        ))
         .execute(&mut **tx)
         .await?;
 
@@ -1675,7 +1781,8 @@ impl ShiftRepository {
                 s.effective_rate_kobo_per_hour, s.grand_total_kobo,
                 s.shift_label, s.job_description, s.draft_quality_score, s.notes,
                 s.created_by, s.broadcast_consent_confirmed, s.matched_clinicians_at_publish,
-                s.broadcast_at, s.billing_triggered_at, s.created_at, s.updated_at
+                s.broadcast_at, s.billing_triggered_at, s.attachment_urls,
+                s.created_at, s.updated_at
             FROM shifts s
             LEFT JOIN hospitals h ON s.hospital_id = h.id
             WHERE s.id = $1
@@ -1898,6 +2005,30 @@ impl ShiftRepository {
         .await?;
 
         Ok(result.rows_affected())
+    }
+
+    /// Record interest inside an existing transaction, ignoring a clinician who
+    /// is already interested. Used by the apply flow; `add_interest` keeps its
+    /// unique-violation error so `express_interest` can report a duplicate.
+    pub async fn add_interest_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        shift_id: Uuid,
+        clinician_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO shift_interests (shift_id, clinician_id)
+            VALUES ($1, $2)
+            ON CONFLICT (shift_id, clinician_id) DO NOTHING
+            "#,
+        )
+        .bind(shift_id)
+        .bind(clinician_id)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
     }
 
     pub async fn add_interest(
