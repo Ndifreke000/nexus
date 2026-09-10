@@ -666,6 +666,11 @@ pub fn create_router(
         // Generic frontend-templated email relay (authenticated).
         .route("/api/v1/emails/send", post(emails::send_email))
         .route("/api/v1/auth/me", get(auth::me))
+        // Patient intake & ML pipeline endpoints
+        .route("/api/v1/ingest/patient", post(patients::ingest_patient))
+        .route("/api/v1/patients", get(patients::list_patients))
+        .route("/api/v1/patients/{id}", get(patients::get_patient))
+        .route("/api/v1/pipeline/events", get(pipeline::pipeline_events))
         // Hospital Registration
         .route(
             "/api/v1/hospitals/register",
