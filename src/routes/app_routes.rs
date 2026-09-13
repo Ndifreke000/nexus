@@ -20,24 +20,28 @@ use utoipa::{
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
-    admin, auth, clinician_registration, distance, earnings, health, here_maps, hospitals,
-    identity, location, notifications, registration, shifts, wallet, webhooks,
+    admin, auth, clinician_registration, consultation_notes, distance, earnings, health,
+    here_maps, hospitals, identity, location, notifications, patients, pipeline, registration,
+    shifts, wallet, webhooks,
 };
 use crate::repositories::{
     admin::AdminRepository, audit::AuditRepository, billing::BillingRepository,
-    clinician::ClinicianRepository,
+    clinician::ClinicianRepository, consultation_note::ConsultationNoteRepository,
     hospital::HospitalRepository, identity_verification::IdentityVerificationRepository,
-    location::LocationRepository, notification::NotificationRepository, shift::ShiftRepository,
-    wallet::WalletRepository,
+    location::LocationRepository, notification::NotificationRepository,
+    patient::PatientRepository, patient_prediction::PatientPredictionRepository,
+    shift::ShiftRepository, wallet::WalletRepository,
 };
 use crate::services::{
     admin_service::AdminService, audit_service::AuditService, auth_service::AuthService,
     clinician_registration_service::ClinicianRegistrationService,
-    distance_service::DistanceService, email_outbox_service::EmailOutboxService,
-    encryption::EncryptionService, fcm::FcmClient, geocoding::GeocodingClient,
-    here_maps::HereMapsClient, identity_verification_service::IdentityVerificationService,
-    location_service::LocationService, notification_service::NotificationService,
-    payout_service::PayoutService, push_service::PushService,
+    consultation_note_service::ConsultationNoteService, distance_service::DistanceService,
+    email_outbox_service::EmailOutboxService, encryption::EncryptionService, fcm::FcmClient,
+    geocoding::GeocodingClient, here_maps::HereMapsClient,
+    identity_verification_service::IdentityVerificationService, location_service::LocationService,
+    ml_client::MlClient, notification_service::NotificationService,
+    patient_prediction_service::PatientPredictionService, payout_service::PayoutService,
+    push_service::PushService,
     registration_service::RegistrationService, safehaven::SafeHavenClient,
     shift_service::ShiftService, wallet_service::WalletService,
 };
@@ -58,6 +62,10 @@ pub struct AppState {
     pub here_maps_client: Arc<HereMapsClient>,
     pub distance_service: Arc<DistanceService>,
     pub push_service: Arc<PushService>,
+    pub patient_repo: Arc<PatientRepository>,
+    pub patient_prediction_service: Arc<PatientPredictionService>,
+    pub pipeline_events: Arc<tokio::sync::broadcast::Sender<crate::models::patient_prediction::PipelineEvent>>,
+    pub consultation_note_service: Arc<ConsultationNoteService>,
 }
 
 #[derive(OpenApi)]
@@ -156,6 +164,18 @@ pub struct AppState {
         crate::handlers::admin::create_admin,
         crate::handlers::admin::list_admins,
         crate::handlers::admin::update_admin,
+        // Patients / ML pipeline
+        crate::handlers::patients::ingest_patient,
+        crate::handlers::patients::get_patient,
+        crate::handlers::patients::list_patients,
+        crate::handlers::pipeline::pipeline_events,
+        // Voice-recorded consultation notes
+        crate::handlers::consultation_notes::start_note,
+        crate::handlers::consultation_notes::list_for_patient,
+        crate::handlers::consultation_notes::get_note,
+        crate::handlers::consultation_notes::upload_audio_chunk,
+        crate::handlers::consultation_notes::update_note,
+        crate::handlers::consultation_notes::complete_note,
         // Wallet
         crate::handlers::wallet::get_wallet,
         crate::handlers::wallet::get_ledger,
@@ -225,8 +245,16 @@ pub struct AppState {
             crate::models::patient_prediction::PredictionResponse,
             crate::handlers::patients::IngestPatientResponse,
             crate::handlers::patients::PatientDetailResponse,
+            crate::handlers::patients::ListPatientsQuery,
             crate::handlers::patients::ErrorResponse,
             crate::handlers::patients::ErrorDetail,
+            // Voice-recorded consultation notes
+            crate::models::consultation_note::ConsultationNote,
+            crate::models::consultation_note::ConsultationTranscriptSegment,
+            crate::models::consultation_note::ConsultationNoteDetail,
+            crate::models::consultation_note::UpdateConsultationNoteRequest,
+            crate::handlers::consultation_notes::StartConsultationNoteResponse,
+            crate::handlers::consultation_notes::AudioChunkResponse,
             // Wallet
             crate::models::wallet::WalletSummary,
             crate::models::wallet::WalletLedgerEntry,
@@ -520,6 +548,29 @@ pub fn create_router(
     let admin_repo = Arc::new(AdminRepository::new(pool.clone()));
     let admin_service = Arc::new(AdminService::new(admin_repo));
 
+    // ML pipeline: patient intake -> ml-service -> SSE. An empty
+    // ML_SERVICE_URL flips MlClient into mock mode (mirrors SafeHavenClient).
+    let ml_client = Arc::new(MlClient::from_env());
+    let (pipeline_tx, _pipeline_rx) =
+        tokio::sync::broadcast::channel::<crate::models::patient_prediction::PipelineEvent>(256);
+    let pipeline_events = Arc::new(pipeline_tx);
+    let patient_prediction_service = Arc::new(PatientPredictionService::new(
+        pool.clone(),
+        patient_repo.clone(),
+        patient_prediction_repo,
+        ml_client.clone(),
+        pipeline_events.clone(),
+    ));
+
+    // Voice-recorded consultation notes: audio chunks are transcribed via
+    // ml-service's Whisper endpoint (same ml_client as the prediction
+    // pipeline above, so mock mode covers both in tests).
+    let consultation_note_repo = Arc::new(ConsultationNoteRepository::new(pool.clone()));
+    let consultation_note_service = Arc::new(ConsultationNoteService::new(
+        consultation_note_repo,
+        ml_client,
+    ));
+
     let state = AppState {
         pool: pool.clone(),
         registration_service,
@@ -535,6 +586,10 @@ pub fn create_router(
         here_maps_client,
         distance_service,
         push_service,
+        patient_repo,
+        patient_prediction_service,
+        pipeline_events,
+        consultation_note_service,
     };
 
     let api_router = Router::new()
@@ -879,9 +934,71 @@ pub fn create_router(
             "/api/v1/notifications",
             get(notifications::list_notifications),
         )
+        // ---- Patient intake + ML pipeline — HealthWorker and HospitalAdmin.
+        .route(
+            "/api/v1/ingest/patient",
+            post(patients::ingest_patient).route_layer(from_fn(require_role(&[
+                UserRole::HealthWorker,
+                UserRole::HospitalAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/patients",
+            get(patients::list_patients).route_layer(from_fn(require_role(&[
+                UserRole::HealthWorker,
+                UserRole::HospitalAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/patients/{id}",
+            get(patients::get_patient).route_layer(from_fn(require_role(&[
+                UserRole::HealthWorker,
+                UserRole::HospitalAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/pipeline/events",
+            get(pipeline::pipeline_events).route_layer(from_fn(require_role(&[
+                UserRole::HealthWorker,
+                UserRole::HospitalAdmin,
+            ]))),
+        )
         .route(
             "/api/v1/notifications/{notification_id}/read",
             post(notifications::mark_notification_read),
+        )
+        // ---- Voice-recorded consultation notes — HealthWorker and HospitalAdmin.
+        .route(
+            "/api/v1/patients/{patient_id}/consultation-notes",
+            get(consultation_notes::list_for_patient)
+                .post(consultation_notes::start_note)
+                .route_layer(from_fn(require_role(&[
+                    UserRole::HealthWorker,
+                    UserRole::HospitalAdmin,
+                ]))),
+        )
+        .route(
+            "/api/v1/consultation-notes/{id}",
+            get(consultation_notes::get_note)
+                .patch(consultation_notes::update_note)
+                .route_layer(from_fn(require_role(&[
+                    UserRole::HealthWorker,
+                    UserRole::HospitalAdmin,
+                ]))),
+        )
+        .route(
+            "/api/v1/consultation-notes/{id}/audio-chunk",
+            post(consultation_notes::upload_audio_chunk).route_layer(from_fn(require_role(&[
+                UserRole::HealthWorker,
+                UserRole::HospitalAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/consultation-notes/{id}/complete",
+            post(consultation_notes::complete_note).route_layer(from_fn(require_role(&[
+                UserRole::HealthWorker,
+                UserRole::HospitalAdmin,
+            ]))),
         )
         .layer(TraceLayer::new_for_http())
         .layer(cors)

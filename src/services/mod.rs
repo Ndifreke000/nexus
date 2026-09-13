@@ -2,6 +2,7 @@ pub mod admin_service;
 pub mod audit_service;
 pub mod auth_service;
 pub mod clinician_registration_service;
+pub mod consultation_note_service;
 pub mod distance_service;
 pub mod email_outbox_service;
 pub mod email_templates;
@@ -27,6 +28,7 @@ pub use audit_service::{AuditService, AuditServiceError, RegistrationDetails};
 pub use clinician_registration_service::{
     ClinicianRegistrationError, ClinicianRegistrationService,
 };
+pub use consultation_note_service::{ConsultationNoteError, ConsultationNoteService};
 pub use email_outbox_service::{EmailOutboxError, EmailOutboxService, EmailOutboxWorker};
 pub use encryption::{EncryptionError, EncryptionService};
 pub use geocoding::{GeocodingClient, GeocodingError};
