@@ -12,6 +12,7 @@ pub mod here_maps;
 pub mod identity_verification_service;
 pub mod location_service;
 pub mod ml_client;
+pub mod ml_service_launcher;
 pub mod notification_service;
 pub mod patient_prediction_service;
 pub mod payout_service;
@@ -34,6 +35,8 @@ pub use identity_verification_service::{
 };
 pub use location_service::{LocationService, LocationServiceError};
 pub use fcm::{FcmClient, FcmError, PushOutcome};
+pub use ml_client::{MlClient, MlClientError};
+pub use ml_service_launcher::MlServiceHandle;
 pub use notification_service::{NotificationError, NotificationService};
 pub use patient_prediction_service::{
     PatientPredictionError, PatientPredictionService, PatientPredictionWorker,
