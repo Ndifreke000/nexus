@@ -2,7 +2,8 @@
 
 FastAPI microservice that trains and serves the 4 clinical decision-support
 models used by NexusCare: diagnosis, mortality risk, drug recommendation, and
-department routing.
+department routing. It also runs speech-to-text for voice-recorded
+consultation notes (see "Voice transcription" below).
 
 ## Models
 
@@ -15,6 +16,35 @@ department routing.
 
 All four are exposed together via `POST /predict/full`, or individually via
 `POST /predict/{diagnosis,risk,recommendation,routing}`.
+
+## Voice transcription
+
+`POST /transcribe` (multipart, field name `audio`) runs self-hosted
+speech-to-text via [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+— used by the Rust backend's consultation-notes feature (see
+`../docs/CONSULTATION_NOTES.md`) so patient audio never leaves this
+infrastructure. Returns `{text, language, language_probability, duration_seconds}`.
+
+The model is lazy-loaded on the **first** `/transcribe` call, not at service
+startup — this keeps `cargo run`'s ml-service auto-start fast for anyone not
+using voice notes. The first call in a fresh environment downloads the model
+from Hugging Face (cached under `~/.cache/huggingface` after that).
+
+Config (all optional — see `.env.example`):
+
+| Var | Default | Notes |
+|---|---|---|
+| `WHISPER_MODEL_SIZE` | `base` | `tiny`/`base`/`small`/`medium`/`large-v3` — bigger is more accurate and slower to download/run. Use `tiny` for fast local iteration on a slow connection. |
+| `WHISPER_DEVICE` | `cpu` | `cpu` or `cuda` |
+| `WHISPER_COMPUTE_TYPE` | `int8` | Fastest on CPU; use `float16` with `WHISPER_DEVICE=cuda` |
+
+**Known gotcha:** Hugging Face's newer "xet" download backend can hang
+indefinitely (not fail — hang) on networks that allow `huggingface.co` but
+block its separate CDN/CAS endpoints (common behind corporate
+proxies/firewalls). `voice.py` sets `HF_HUB_DISABLE_XET=1` by default to
+avoid this — the plain HTTPS fallback is slower but fails visibly instead of
+hanging a request thread. Override with `HF_HUB_DISABLE_XET=0` if xet works
+fine on your network and you want the faster download.
 
 ## Data
 
