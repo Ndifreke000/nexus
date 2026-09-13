@@ -10,7 +10,7 @@ department routing.
 |---|---|---|---|
 | Diagnosis | `GradientBoostingClassifier` | `disease_type` (Chronic / Genetic / Infectious / MentalHealth) | Trained on TF-IDF of `symptoms` + `existing_conditions` plus demographics/genotype. |
 | Mortality risk | `RandomForestClassifier` + SMOTE | `mortality_risk` (Low / Medium / High) | Class-balanced via SMOTE oversampling of the minority "High" class. |
-| Recommendation | `DecisionTreeClassifier` | `drug_recommendation` | Phase 1 only — swap for a data-driven recommender once real prescriptions accumulate. Currently the weakest model (macro F1 ≈ 0.3–0.4). |
+| Recommendation | `RandomForestClassifier` | `drug_recommendation` | Phase 1 only — swap for a data-driven recommender once real prescriptions accumulate. Macro F1 ≈ 0.71 on synthetic data (was ≈ 0.3, capped by a label independent of every input feature — see `choose_drug` in `generate_training_data.py`); every prediction below `LOW_CONFIDENCE_THRESHOLD` (0.5) sets `low_confidence: true` in the response regardless. |
 | Routing | Rule-based JSON (`models/routing_rules.json`) | department + alert priority | Deterministic disease/severity → department/route matrix, not a trained model. |
 
 All four are exposed together via `POST /predict/full`, or individually via
@@ -68,21 +68,19 @@ retraining in production.
   unaffected by CORS either way.
 - `ML_RETRAIN_API_KEY` gates `POST /retrain` and `POST /export-training-data`
   via an `X-API-Key` header — both endpoints shell out to trusted scripts and
-  touch the database, so they shouldn't be publicly callable. If unset, the
-  service logs a startup warning and runs those two endpoints unauthenticated
-  (fine for local dev only).
+  touch the database, so they shouldn't be publicly callable. Required: if
+  unset, both endpoints reject every request rather than running open — set
+  it even for local dev (`.env` ships a generated dev key).
 
 ## Known limitations
 
 - Trained on synthetic data until real labeled patient records accumulate in
   `patient_training_data`.
-- No probability calibration, drift detection, or explainability endpoint.
-- `LabelEncoder` fallback (`safe_encode` in `main.py`) returns `0` for any
-  category unseen at training time, which can silently bias predictions if
-  real-world data introduces many new categories.
-- Recommendation model's accuracy is materially weaker than the other two
-  trained models — treat its output as a rough prior, not a suggestion to
-  surface directly to clinicians without review.
+- No probability calibration or drift detection endpoint yet.
+- Every prediction carries a `low_confidence` flag (confidence <
+  `LOW_CONFIDENCE_THRESHOLD` = 0.5) — treat those as a rough prior, not a
+  suggestion to surface to clinicians without review, especially recommendation
+  output.
 
 ## Files
 
