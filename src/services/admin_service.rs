@@ -7,15 +7,27 @@ use uuid::Uuid;
 use crate::models::admin::*;
 use crate::models::user::UserRole;
 use crate::repositories::admin::AdminRepository;
+use crate::services::email_outbox_service::EmailOutboxService;
+use crate::services::email_templates;
 use crate::utils::errors::AppError;
 
 pub struct AdminService {
     repo: Arc<AdminRepository>,
+    email_outbox: Arc<EmailOutboxService>,
+    /// Base URL of the admin console, used to build the invite login link.
+    admin_app_url: String,
 }
 
 impl AdminService {
-    pub fn new(repo: Arc<AdminRepository>) -> Self {
-        Self { repo }
+    pub fn new(repo: Arc<AdminRepository>, email_outbox: Arc<EmailOutboxService>) -> Self {
+        let admin_app_url = std::env::var("ADMIN_APP_URL")
+            .or_else(|_| std::env::var("API_BASE_URL"))
+            .unwrap_or_else(|_| "http://localhost:8080".to_string());
+        Self {
+            repo,
+            email_outbox,
+            admin_app_url,
+        }
     }
 
     pub async fn dashboard(&self) -> Result<DashboardMetrics, AppError> {
@@ -311,7 +323,15 @@ impl AdminService {
         req: CreateAdminRequest,
     ) -> Result<AdminSummary, AppError> {
         Self::validate_admin_role(&req.role)?;
-        Ok(self
+        // Enforce a minimum password length before hashing.
+        if req.password.len() < 8 {
+            return Err(AppError::BadRequest(
+                "password must be at least 8 characters".into(),
+            ));
+        }
+        let password_hash = crate::services::auth_service::hash_password(&req.password)
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+        let admin = self
             .repo
             .create_admin(
                 &req.first_name,
@@ -319,8 +339,24 @@ impl AdminService {
                 &req.email,
                 req.phone.as_deref(),
                 &req.role,
+                &password_hash,
             )
-            .await?)
+            .await?;
+
+        // Best-effort invite email with the login link + initial password.
+        let login_url = format!("{}/admin/login", self.admin_app_url.trim_end_matches('/'));
+        let content = email_templates::admin_invite(
+            &req.first_name,
+            &req.role,
+            &req.email,
+            &req.password,
+            &login_url,
+        );
+        if let Err(e) = self.email_outbox.enqueue_email(&req.email, &content).await {
+            tracing::warn!("Failed to queue admin invite email for {}: {e}", req.email);
+        }
+
+        Ok(admin)
     }
 
     pub async fn list_admins(&self) -> Result<Vec<AdminSummary>, AppError> {
@@ -339,5 +375,66 @@ impl AdminService {
             .update_admin(id, req.role.as_deref(), req.is_active)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Admin {id} not found")))
+    }
+
+    // ----- Detail views -----------------------------------------------------
+
+    pub async fn hospital_detail(&self, id: Uuid) -> Result<HospitalDetail, AppError> {
+        self.repo
+            .get_hospital_detail(id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Hospital {id} not found")))
+    }
+
+    pub async fn worker_detail(&self, id: Uuid) -> Result<WorkerDetail, AppError> {
+        self.repo
+            .get_worker_detail(id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Worker {id} not found")))
+    }
+
+    // ----- Revenue trend ----------------------------------------------------
+
+    /// Revenue over time. `period` ∈ {day, week, month}; window defaults to the
+    /// last 30 days when `from`/`to` are omitted.
+    pub async fn revenue_trend(
+        &self,
+        period: Option<&str>,
+        from: Option<chrono::DateTime<chrono::Utc>>,
+        to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RevenueTrend, AppError> {
+        let period = period.unwrap_or("day").to_ascii_lowercase();
+        if !matches!(period.as_str(), "day" | "week" | "month") {
+            return Err(AppError::Validation(
+                "period must be one of: day, week, month".to_string(),
+            ));
+        }
+        let to = to.unwrap_or_else(chrono::Utc::now);
+        let from = from.unwrap_or_else(|| to - chrono::Duration::days(30));
+        let points = self.repo.revenue_trend(&period, from, to).await?;
+        Ok(RevenueTrend { period, points })
+    }
+
+    // ----- Recent activities ------------------------------------------------
+
+    pub async fn recent_activities(&self, limit: i64) -> Result<Vec<ActivityItem>, AppError> {
+        Ok(self.repo.recent_activities(limit.clamp(1, 100)).await?)
+    }
+
+    // ----- Global search ----------------------------------------------------
+
+    pub async fn search(&self, query: &str) -> Result<SearchResults, AppError> {
+        let query = query.trim();
+        if query.len() < 2 {
+            return Err(AppError::Validation(
+                "search query must be at least 2 characters".to_string(),
+            ));
+        }
+        let (hospitals, workers) = self.repo.search(query, 10).await?;
+        Ok(SearchResults {
+            query: query.to_string(),
+            hospitals,
+            workers,
+        })
     }
 }

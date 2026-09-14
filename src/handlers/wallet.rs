@@ -11,10 +11,11 @@ use uuid::Uuid;
 use validator::Validate;
 
 use crate::models::wallet::{
-    CreateDepositRequest, DepositResponse, WalletLedgerEntry, WalletSummary,
+    CreateDepositRequest, DepositInstructions, DepositResponse, WalletLedgerEntry, WalletSummary,
+    WithdrawRequest, WithdrawResponse, WithdrawalRow,
 };
 use crate::routes::AppState;
-use crate::services::wallet_service::WalletServiceError;
+use crate::services::wallet_service::{ReconcileResult, WalletServiceError};
 use crate::utils::{
     errors::{AppError, AppResult},
     extract_claims,
@@ -130,31 +131,56 @@ pub async fn get_ledger(
     path = "/api/v1/wallet/deposits",
     request_body = CreateDepositRequest,
     responses(
-        (status = 201, description = "Deposit virtual account minted", body = DepositResponse),
+        (status = 200, description = "Sub-account funding instructions", body = DepositInstructions),
         (status = 401, body = ErrorResponse),
         (status = 403, body = ErrorResponse),
-        (status = 409, description = "Payment provider error", body = ErrorResponse),
-        (status = 422, description = "Validation error", body = ErrorResponse)
+        (status = 422, description = "No wallet yet / validation error", body = ErrorResponse)
     ),
     tag = "wallet",
-    summary = "Request a deposit virtual account",
-    description = "Returns a SafeHaven virtual account the hospital can transfer into. We credit the wallet automatically when SafeHaven fires the inbound webhook."
+    summary = "Get wallet funding instructions",
+    description = "Returns the hospital's dedicated SafeHaven sub-account to transfer into. The wallet is credited automatically when SafeHaven fires the inbound credit webhook. (Create the wallet first via /wallet/sub-account/*.)"
 )]
 pub async fn create_deposit(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<CreateDepositRequest>,
-) -> AppResult<(StatusCode, Json<DepositResponse>)> {
+) -> AppResult<(StatusCode, Json<DepositInstructions>)> {
     payload
         .validate()
         .map_err(|e| AppError::Validation(e.to_string()))?;
     let hospital_id = hospital_id_from_claims(&headers)?;
-    let row = state
+    let instructions = state
         .wallet_service
-        .request_deposit(hospital_id, payload.amount_kobo)
+        .deposit_instructions(hospital_id, payload.amount_kobo)
         .await
         .map_err(map_wallet_error)?;
-    Ok((StatusCode::CREATED, Json(row.into())))
+    Ok((StatusCode::OK, Json(instructions)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/wallet/reconcile",
+    responses(
+        (status = 200, description = "Reconcile result", body = ReconcileResult),
+        (status = 401, body = ErrorResponse),
+        (status = 403, body = ErrorResponse),
+        (status = 422, description = "No wallet yet", body = ErrorResponse)
+    ),
+    tag = "wallet",
+    summary = "Reconcile wallet deposits against SafeHaven",
+    description = "Pulls the hospital sub-account's transaction history from SafeHaven and credits any inbound transfer missed by a webhook (e.g. delivered to a stale callback). Idempotent."
+)]
+pub async fn reconcile_deposits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<ReconcileResult>> {
+    let hospital_id = hospital_id_from_claims(&headers)?;
+    let result = state
+        .wallet_service
+        .reconcile_deposits(hospital_id)
+        .await
+        .map_err(map_wallet_error)?;
+    Ok(Json(result))
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
@@ -187,6 +213,124 @@ pub async fn list_deposits(
         .await
         .map_err(map_wallet_error)?;
     Ok(Json(rows.into_iter().map(DepositResponse::from).collect()))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/wallet/withdraw",
+    request_body = WithdrawRequest,
+    responses(
+        (status = 200, description = "Withdrawal initiated", body = WithdrawResponse),
+        (status = 401, body = ErrorResponse),
+        (status = 403, body = ErrorResponse),
+        (status = 409, description = "Insufficient balance or provider rejection", body = ErrorResponse),
+        (status = 422, description = "No wallet yet / validation error", body = ErrorResponse)
+    ),
+    tag = "wallet",
+    summary = "Withdraw wallet funds to a bank account",
+    description = "Debits available wallet balance and transfers it from the hospital's SafeHaven sub-account to the given bank account. The destination is validated via name-enquiry; a synchronous provider rejection refunds the balance."
+)]
+pub async fn withdraw(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<WithdrawRequest>,
+) -> AppResult<Json<WithdrawResponse>> {
+    payload
+        .validate()
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+    let hospital_id = hospital_id_from_claims(&headers)?;
+    let resp = state
+        .wallet_service
+        .withdraw(
+            hospital_id,
+            payload.amount_kobo,
+            &payload.bank_code,
+            &payload.account_number,
+            payload.narration.as_deref(),
+        )
+        .await
+        .map_err(map_wallet_error)?;
+    Ok(Json(resp))
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct WithdrawalPage {
+    pub withdrawals: Vec<WithdrawalRow>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/wallet/withdrawals",
+    params(LedgerQuery),
+    responses(
+        (status = 200, description = "Paginated withdrawal history", body = WithdrawalPage),
+        (status = 401, body = ErrorResponse),
+        (status = 403, body = ErrorResponse)
+    ),
+    tag = "wallet",
+    summary = "List this hospital's withdrawals"
+)]
+pub async fn list_withdrawals(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<LedgerQuery>,
+) -> AppResult<Json<WithdrawalPage>> {
+    let hospital_id = hospital_id_from_claims(&headers)?;
+    let page = q.page.unwrap_or(1).max(1);
+    let page_size = q.page_size.unwrap_or(50).clamp(1, 200);
+    let (withdrawals, total) = state
+        .wallet_service
+        .list_withdrawals(hospital_id, page, page_size)
+        .await
+        .map_err(map_wallet_error)?;
+    Ok(Json(WithdrawalPage {
+        withdrawals,
+        total,
+        page,
+        page_size,
+    }))
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct WithdrawalStatusResponse {
+    pub withdrawal_id: Uuid,
+    pub status: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/wallet/withdrawals/{withdrawal_id}/status",
+    params(("withdrawal_id" = Uuid, Path, description = "Withdrawal (billing transaction) id")),
+    responses(
+        (status = 200, description = "Current withdrawal status (refreshed from SafeHaven if pending)", body = WithdrawalStatusResponse),
+        (status = 401, body = ErrorResponse),
+        (status = 403, body = ErrorResponse),
+        (status = 404, description = "Withdrawal not found", body = ErrorResponse)
+    ),
+    tag = "wallet",
+    summary = "Get/refresh a withdrawal's transfer status"
+)]
+pub async fn get_withdrawal_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(withdrawal_id): axum::extract::Path<Uuid>,
+) -> AppResult<Json<WithdrawalStatusResponse>> {
+    let hospital_id = hospital_id_from_claims(&headers)?;
+    let status = state
+        .wallet_service
+        .refresh_withdrawal_status(hospital_id, withdrawal_id)
+        .await
+        .map_err(map_wallet_error)?;
+    if status == "not_found" {
+        return Err(AppError::NotFound("Withdrawal not found".to_string()));
+    }
+    Ok(Json(WithdrawalStatusResponse {
+        withdrawal_id,
+        status,
+    }))
 }
 
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]

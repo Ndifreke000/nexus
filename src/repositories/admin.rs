@@ -346,6 +346,7 @@ impl AdminRepository {
             r#"
             SELECT
                 platform_fee_percent::DOUBLE PRECISION        AS platform_fee_percent,
+                platform_fee_cap_kobo,
                 worker_broadcast_radius_km::DOUBLE PRECISION  AS worker_broadcast_radius_km,
                 stat_bonus_percent::DOUBLE PRECISION          AS stat_bonus_percent,
                 urgent_bonus_percent::DOUBLE PRECISION        AS urgent_bonus_percent,
@@ -385,7 +386,8 @@ impl AdminRepository {
                 max_active_shifts_per_hospital = COALESCE($9, max_active_shifts_per_hospital),
                 min_hourly_rate_kobo        = COALESCE($10, min_hourly_rate_kobo),
                 max_recording_minutes       = COALESCE($11, max_recording_minutes),
-                updated_by = $12,
+                platform_fee_cap_kobo       = COALESCE($12, platform_fee_cap_kobo),
+                updated_by = $13,
                 updated_at = NOW()
             WHERE singleton = 'global'
             "#,
@@ -401,6 +403,7 @@ impl AdminRepository {
         .bind(p.max_active_shifts_per_hospital)
         .bind(p.min_hourly_rate_kobo)
         .bind(p.max_recording_minutes)
+        .bind(p.platform_fee_cap_kobo)
         .bind(updated_by)
         .execute(&self.pool)
         .await?;
@@ -545,7 +548,7 @@ impl AdminRepository {
 
     // ----- §1 Admin management (super only) ---------------------------------
 
-    /// Create an admin user row; login is via the platform's OTP flow (no password).
+    /// Create an admin user row with an initial password hash for admin login.
     pub async fn create_admin(
         &self,
         first_name: &str,
@@ -553,11 +556,12 @@ impl AdminRepository {
         email: &str,
         phone: Option<&str>,
         role: &str,
+        password_hash: &str,
     ) -> Result<AdminSummary, sqlx::Error> {
         sqlx::query_as::<_, AdminSummary>(
             r#"
-            INSERT INTO users (first_name, last_name, email, phone, role, is_active)
-            VALUES ($1, $2, $3, $4, $5::user_role, TRUE)
+            INSERT INTO users (first_name, last_name, email, phone, role, password_hash, is_active)
+            VALUES ($1, $2, $3, $4, $5::user_role, $6, TRUE)
             RETURNING id, first_name, last_name, email, role::TEXT AS role, is_active, created_at
             "#,
         )
@@ -566,6 +570,7 @@ impl AdminRepository {
         .bind(email)
         .bind(phone)
         .bind(role)
+        .bind(password_hash)
         .fetch_one(&self.pool)
         .await
     }
@@ -622,5 +627,267 @@ impl AdminRepository {
             }
             None => Ok(None),
         }
+    }
+
+    // ----- Detail views -----------------------------------------------------
+
+    /// Full hospital record + admin contact + wallet + shift/spend aggregates.
+    pub async fn get_hospital_detail(
+        &self,
+        hospital_id: Uuid,
+    ) -> Result<Option<HospitalDetail>, sqlx::Error> {
+        sqlx::query_as::<_, HospitalDetail>(
+            r#"
+            SELECT
+                h.id,
+                h.name,
+                h.registration_number,
+                h.email,
+                h.address,
+                h.phone_number,
+                h.verification_status::TEXT           AS verification_status,
+                h.registration_step::TEXT             AS registration_step,
+                h.admin_registration_status::TEXT     AS admin_registration_status,
+                h.setup_progress_percent,
+                h.logo_url,
+                h.approved_at,
+                h.created_at,
+                -- Fall back to the admin details captured at registration so
+                -- the contact is populated even before the admin `users` row
+                -- exists (i.e. pre-approval). Avoids a null "unknown user".
+                COALESCE(NULLIF(u.first_name, ''), h.admin_first_name) AS admin_first_name,
+                COALESCE(NULLIF(u.last_name, ''), h.admin_last_name)   AS admin_last_name,
+                COALESCE(u.email, h.email)            AS admin_email,
+                COALESCE(u.phone, h.phone_number)     AS admin_phone,
+                COALESCE(w.balance_kobo, 0)::BIGINT   AS wallet_balance_kobo,
+                COALESCE(w.held_kobo, 0)::BIGINT      AS wallet_held_kobo,
+                w.safehaven_account_number,
+                (SELECT COUNT(*) FROM shifts s WHERE s.hospital_id = h.id)::BIGINT AS total_shifts,
+                (SELECT COUNT(*) FROM shifts s WHERE s.hospital_id = h.id
+                    AND s.status IN ('open','assigned','in_progress'))::BIGINT     AS active_shifts,
+                (SELECT COUNT(*) FROM shifts s WHERE s.hospital_id = h.id
+                    AND s.status = 'completed')::BIGINT                            AS completed_shifts,
+                (SELECT COALESCE(SUM(bt.amount_kobo), 0) FROM billing_transactions bt
+                    WHERE bt.hospital_id = h.id AND bt.event_type = 'payout'
+                      AND bt.status = 'success')::BIGINT                           AS total_spent_kobo,
+                EXISTS (SELECT 1 FROM identity_verifications iv
+                    WHERE iv.owner_type = 'hospital' AND iv.owner_id = h.id
+                      AND iv.status = 'verified')                                  AS identity_verified,
+                -- Summary of compliance-document review state (image 2).
+                CASE
+                    WHEN EXISTS (SELECT 1 FROM hospital_documents d WHERE d.hospital_id = h.id
+                        AND d.submission_status = 'approved') THEN 'verified'
+                    WHEN EXISTS (SELECT 1 FROM hospital_documents d WHERE d.hospital_id = h.id
+                        AND d.submission_status = 'under_review') THEN 'under_review'
+                    WHEN EXISTS (SELECT 1 FROM hospital_documents d WHERE d.hospital_id = h.id)
+                        THEN 'submitted'
+                    ELSE 'unverified'
+                END                                                                AS documents_status,
+                -- Payment method = a provisioned SafeHaven wallet account.
+                (w.safehaven_account_number IS NOT NULL)                           AS payment_method_on_file,
+                r.avg_rating                          AS average_rating,
+                COALESCE(r.rating_count, 0)::BIGINT   AS rating_count,
+                r.avg_staff_support                   AS rating_staff_support,
+                r.avg_equipment_availability          AS rating_equipment_availability,
+                r.avg_communication                   AS rating_communication,
+                r.avg_payment_timeliness              AS rating_payment_timeliness
+            FROM hospitals h
+            LEFT JOIN users u            ON u.id = h.admin_user_id
+            LEFT JOIN hospital_wallets w ON w.hospital_id = h.id
+            -- Aggregate worker-submitted ratings for this hospital (4 dimensions).
+            LEFT JOIN LATERAL (
+                SELECT
+                    AVG(sr.score)::FLOAT8                                     AS avg_rating,
+                    COUNT(*)                                                  AS rating_count,
+                    AVG((sr.dimensions->>'staff_support')::NUMERIC)::FLOAT8   AS avg_staff_support,
+                    AVG((sr.dimensions->>'equipment_availability')::NUMERIC)::FLOAT8 AS avg_equipment_availability,
+                    AVG((sr.dimensions->>'communication')::NUMERIC)::FLOAT8   AS avg_communication,
+                    AVG((sr.dimensions->>'payment_timeliness')::NUMERIC)::FLOAT8 AS avg_payment_timeliness
+                FROM shift_ratings sr
+                WHERE sr.ratee_kind = 'hospital' AND sr.ratee_id = h.id
+            ) r ON TRUE
+            WHERE h.id = $1
+            "#,
+        )
+        .bind(hospital_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Full worker record + user contact + bank presence + earnings aggregates.
+    pub async fn get_worker_detail(
+        &self,
+        clinician_id: Uuid,
+    ) -> Result<Option<WorkerDetail>, sqlx::Error> {
+        sqlx::query_as::<_, WorkerDetail>(
+            r#"
+            SELECT
+                c.id,
+                c.user_id,
+                c.first_name,
+                c.last_name,
+                u.email,
+                u.phone,
+                c.specialty::TEXT                     AS specialty,
+                c.role_title,
+                c.license_number,
+                c.rating::REAL                        AS rating,
+                c.rating_count,
+                c.acceptance_rate_pct,
+                c.availability::TEXT                  AS availability,
+                c.is_verified,
+                c.is_active,
+                c.created_at,
+                (ba.clinician_id IS NOT NULL)         AS has_bank_account,
+                ba.account_name                       AS bank_account_name,
+                (SELECT COUNT(*) FROM shifts s WHERE s.assigned_clinician_id = c.id
+                    AND s.status = 'completed')::BIGINT AS completed_shifts,
+                (SELECT COALESCE(SUM(bt.amount_kobo), 0)
+                    FROM billing_transactions bt
+                    JOIN shifts s ON s.id = bt.shift_id
+                    WHERE s.assigned_clinician_id = c.id
+                      AND bt.event_type = 'payout' AND bt.status = 'success')::BIGINT AS total_earned_kobo,
+                EXISTS (SELECT 1 FROM identity_verifications iv
+                    WHERE iv.owner_type = 'clinician' AND iv.owner_id = c.id
+                      AND iv.status = 'verified')      AS identity_verified
+            FROM clinicians c
+            JOIN users u                     ON u.id = c.user_id
+            LEFT JOIN clinician_bank_accounts ba ON ba.clinician_id = c.id
+            WHERE c.id = $1
+            "#,
+        )
+        .bind(clinician_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    // ----- Revenue trend (time series) --------------------------------------
+
+    /// Revenue bucketed by day/week/month over [from, to). `period` must be one
+    /// of `day`|`week`|`month` (validated by the service).
+    pub async fn revenue_trend(
+        &self,
+        period: &str,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<RevenuePoint>, sqlx::Error> {
+        sqlx::query_as::<_, RevenuePoint>(
+            r#"
+            SELECT
+                date_trunc($1, created_at)      AS bucket,
+                COALESCE(SUM(gross_kobo), 0)::BIGINT AS gross_kobo,
+                COALESCE(SUM(fee_kobo), 0)::BIGINT   AS fee_kobo,
+                COALESCE(SUM(net_kobo), 0)::BIGINT   AS net_kobo,
+                COUNT(*)::BIGINT                     AS payouts
+            FROM platform_revenue_ledger
+            WHERE created_at >= $2 AND created_at < $3
+            GROUP BY bucket
+            ORDER BY bucket ASC
+            "#,
+        )
+        .bind(period)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    // ----- Recent activities (multi-source union) ---------------------------
+
+    /// Newest-first union of registration, shift, payout, and deposit events.
+    pub async fn recent_activities(&self, limit: i64) -> Result<Vec<ActivityItem>, sqlx::Error> {
+        sqlx::query_as::<_, ActivityItem>(
+            r#"
+            SELECT * FROM (
+                -- Hospital registration step changes / approvals
+                SELECT
+                    CASE WHEN ral.new_step = 'access_granted' THEN 'hospital_approved'
+                         ELSE 'hospital_registered' END AS kind,
+                    h.name                               AS title,
+                    ral.new_step                         AS subtitle,
+                    ral.hospital_id                      AS entity_id,
+                    NULL::BIGINT                         AS amount_kobo,
+                    ral.created_at                       AS occurred_at
+                FROM registration_audit_log ral
+                JOIN hospitals h ON h.id = ral.hospital_id
+
+                UNION ALL
+                -- Shift created / completed
+                SELECT
+                    CASE WHEN s.status = 'completed' THEN 'shift_completed'
+                         ELSE 'shift_created' END        AS kind,
+                    s.role_title                          AS title,
+                    s.status::TEXT                        AS subtitle,
+                    s.id                                  AS entity_id,
+                    s.grand_total_kobo                    AS amount_kobo,
+                    s.created_at                          AS occurred_at
+                FROM shifts s
+
+                UNION ALL
+                -- Payout / deposit billing events
+                SELECT
+                    bt.event_type::TEXT                   AS kind,
+                    bt.event_type::TEXT                   AS title,
+                    bt.status::TEXT                       AS subtitle,
+                    bt.hospital_id                        AS entity_id,
+                    bt.amount_kobo                        AS amount_kobo,
+                    bt.created_at                         AS occurred_at
+                FROM billing_transactions bt
+                WHERE bt.event_type IN ('payout', 'deposit')
+            ) feed
+            ORDER BY occurred_at DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    // ----- Global search (hospitals + workers) ------------------------------
+
+    /// Case-insensitive search over hospitals and clinicians. `per_kind` caps
+    /// each group.
+    pub async fn search(
+        &self,
+        query: &str,
+        per_kind: i64,
+    ) -> Result<(Vec<SearchHit>, Vec<SearchHit>), sqlx::Error> {
+        let pattern = format!("%{}%", query);
+
+        let hospitals = sqlx::query_as::<_, SearchHit>(
+            r#"
+            SELECT id, 'hospital' AS kind, name AS title,
+                   registration_number AS subtitle
+            FROM hospitals
+            WHERE name ILIKE $1 OR registration_number ILIKE $1 OR email ILIKE $1
+            ORDER BY name ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(&pattern)
+        .bind(per_kind)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let workers = sqlx::query_as::<_, SearchHit>(
+            r#"
+            SELECT c.id, 'worker' AS kind,
+                   (c.first_name || ' ' || c.last_name) AS title,
+                   u.email AS subtitle
+            FROM clinicians c
+            JOIN users u ON u.id = c.user_id
+            WHERE c.first_name ILIKE $1 OR c.last_name ILIKE $1
+               OR u.email ILIKE $1 OR c.license_number ILIKE $1
+            ORDER BY c.first_name ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(&pattern)
+        .bind(per_kind)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((hospitals, workers))
     }
 }

@@ -160,7 +160,7 @@ impl IdentityVerificationService {
         owner_id: Uuid,
         id_type: IdentityKind,
         otp: &str,
-    ) -> Result<(), IdentityError> {
+    ) -> Result<serde_json::Value, IdentityError> {
         let row = self
             .repo
             .get(owner.as_str(), owner_id, id_type.as_db())
@@ -195,7 +195,7 @@ impl IdentityVerificationService {
             .mark_verified(owner.as_str(), owner_id, id_type.as_db(), &payload)
             .await?;
 
-        Ok(())
+        Ok(payload)
     }
 
     /// True if either BVN or NIN is verified for this owner (either suffices).
@@ -206,6 +206,19 @@ impl IdentityVerificationService {
     ) -> Result<bool, IdentityError> {
         Ok(self.repo.any_verified(owner.as_str(), owner_id).await?)
     }
+
+    /// Fetch stored `provider_payload` + `identity_type` for a verified identity.
+    pub async fn get_verified_payload(
+        &self,
+        owner: IdentityOwner,
+        owner_id: Uuid,
+    ) -> Result<Option<(String, serde_json::Value)>, IdentityError> {
+        Ok(self
+            .repo
+            .get_verified_payload(owner.as_str(), owner_id)
+            .await?)
+    }
+
 
     /// Decrypt a stored, verified identity number (e.g. to pass a verified BVN
     /// into wallet sub-account provisioning). Returns None if not present.

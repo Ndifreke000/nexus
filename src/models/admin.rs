@@ -168,6 +168,8 @@ pub struct ResolveDisputeRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema, FromRow)]
 pub struct PlatformSettings {
     pub platform_fee_percent: f64,
+    /// Max fee taken per payout in kobo; NULL = no cap.
+    pub platform_fee_cap_kobo: Option<i64>,
     pub worker_broadcast_radius_km: f64,
     pub stat_bonus_percent: f64,
     pub urgent_bonus_percent: f64,
@@ -185,6 +187,7 @@ pub struct PlatformSettings {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdatePlatformSettings {
     pub platform_fee_percent: Option<f64>,
+    pub platform_fee_cap_kobo: Option<i64>,
     pub worker_broadcast_radius_km: Option<f64>,
     pub stat_bonus_percent: Option<f64>,
     pub urgent_bonus_percent: Option<f64>,
@@ -280,6 +283,8 @@ pub struct CreateAdminRequest {
     pub phone: Option<String>,
     /// One of: operations_admin, verification_admin, finance_admin, super_admin.
     pub role: String,
+    /// Initial password the new admin uses at POST /auth/admin/login.
+    pub password: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -297,4 +302,143 @@ pub struct AdminSummary {
     pub role: String,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------------------
+// Detail views — single hospital / single worker (drill-down)
+// ---------------------------------------------------------------------------
+
+/// Full hospital record for the admin drill-down view.
+#[derive(Debug, Serialize, Deserialize, ToSchema, FromRow)]
+pub struct HospitalDetail {
+    pub id: Uuid,
+    pub name: String,
+    pub registration_number: String,
+    pub email: String,
+    pub address: String,
+    pub phone_number: String,
+    pub verification_status: String,
+    pub registration_step: String,
+    pub admin_registration_status: Option<String>,
+    pub setup_progress_percent: i16,
+    pub logo_url: Option<String>,
+    pub approved_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    // Admin (contact) user
+    pub admin_first_name: Option<String>,
+    pub admin_last_name: Option<String>,
+    pub admin_email: Option<String>,
+    pub admin_phone: Option<String>,
+    // Wallet
+    pub wallet_balance_kobo: i64,
+    pub wallet_held_kobo: i64,
+    pub safehaven_account_number: Option<String>,
+    // Aggregates
+    pub total_shifts: i64,
+    pub active_shifts: i64,
+    pub completed_shifts: i64,
+    pub total_spent_kobo: i64,
+    // Identity
+    pub identity_verified: bool,
+    // Compliance documents summary + payment method presence (image 2)
+    pub documents_status: String,
+    pub payment_method_on_file: bool,
+    // Ratings (from workers rating this hospital after shifts)
+    pub average_rating: Option<f64>,
+    pub rating_count: i64,
+    // Per-dimension averages for the rating breakdown (image 2)
+    pub rating_staff_support: Option<f64>,
+    pub rating_equipment_availability: Option<f64>,
+    pub rating_communication: Option<f64>,
+    pub rating_payment_timeliness: Option<f64>,
+}
+
+/// Full worker (clinician) record for the admin drill-down view.
+#[derive(Debug, Serialize, Deserialize, ToSchema, FromRow)]
+pub struct WorkerDetail {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub first_name: String,
+    pub last_name: String,
+    pub email: String,
+    pub phone: Option<String>,
+    pub specialty: String,
+    pub role_title: String,
+    pub license_number: Option<String>,
+    pub rating: f32,
+    pub rating_count: i32,
+    pub acceptance_rate_pct: Option<f32>,
+    pub availability: String,
+    pub is_verified: bool,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    // Bank account (masked)
+    pub has_bank_account: bool,
+    pub bank_account_name: Option<String>,
+    // Aggregates
+    pub completed_shifts: i64,
+    pub total_earned_kobo: i64,
+    // Identity
+    pub identity_verified: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Revenue trend (time series) — distinct from the RevenueBreakdown snapshot
+// ---------------------------------------------------------------------------
+
+/// One time bucket of platform revenue.
+#[derive(Debug, Serialize, Deserialize, ToSchema, FromRow)]
+pub struct RevenuePoint {
+    pub bucket: DateTime<Utc>,
+    pub gross_kobo: i64,
+    pub fee_kobo: i64,
+    pub net_kobo: i64,
+    pub payouts: i64,
+}
+
+/// Revenue over time, bucketed by day/week/month.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RevenueTrend {
+    /// Bucketing period: `day`, `week`, or `month`.
+    pub period: String,
+    pub points: Vec<RevenuePoint>,
+}
+
+// ---------------------------------------------------------------------------
+// Recent activities (multi-source union feed)
+// ---------------------------------------------------------------------------
+
+/// A single item in the recent-activity feed. `kind` tags the source event.
+#[derive(Debug, Serialize, Deserialize, ToSchema, FromRow)]
+pub struct ActivityItem {
+    /// e.g. `hospital_registered`, `hospital_approved`, `shift_created`,
+    /// `shift_completed`, `payout`, `deposit`.
+    pub kind: String,
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub entity_id: Option<Uuid>,
+    pub amount_kobo: Option<i64>,
+    pub occurred_at: DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------------------
+// Global search (hospitals + workers)
+// ---------------------------------------------------------------------------
+
+/// One search hit (hospital or worker).
+#[derive(Debug, Serialize, Deserialize, ToSchema, FromRow)]
+pub struct SearchHit {
+    pub id: Uuid,
+    /// `hospital` or `worker`.
+    pub kind: String,
+    pub title: String,
+    pub subtitle: Option<String>,
+}
+
+/// Grouped global-search results.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SearchResults {
+    pub query: String,
+    pub hospitals: Vec<SearchHit>,
+    pub workers: Vec<SearchHit>,
 }

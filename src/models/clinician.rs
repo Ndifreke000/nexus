@@ -30,7 +30,7 @@ pub enum ClinicalSpecialty {
 }
 
 /// Real-time availability status of a clinician shown in the Workforce Pool.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema)]
 #[sqlx(type_name = "clinician_availability", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum ClinicianAvailability {
@@ -139,5 +139,36 @@ pub struct ClinicianAdminSummary {
     pub specialty: ClinicalSpecialty,
     pub is_verified: bool,
     pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    // Enriched card fields (from the same clinician row — no extra query).
+    pub rating: f32,
+    pub rating_count: i32,
+    pub availability: ClinicianAvailability,
+    // Completed-shift count + last-known location for the admin list (image).
+    pub completed_shifts: i64,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+}
+
+/// Public worker profile — the general (ungated) drill-down. Excludes the
+/// sensitive contact, bank-account and earnings data that stay admin-only.
+#[derive(Debug, Serialize, Deserialize, ToSchema, FromRow)]
+pub struct WorkerPublicDetail {
+    pub id: Uuid,
+    pub first_name: String,
+    pub last_name: String,
+    pub specialty: String,
+    pub role_title: String,
+    pub license_number: Option<String>,
+    pub rating: f32,
+    pub rating_count: i32,
+    pub acceptance_rate_pct: Option<f32>,
+    pub availability: String,
+    pub is_verified: bool,
+    pub is_active: bool,
+    pub identity_verified: bool,
+    pub completed_shifts: i64,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
     pub created_at: DateTime<Utc>,
 }

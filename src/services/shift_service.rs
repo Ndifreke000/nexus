@@ -127,6 +127,65 @@ pub enum ShiftServiceError {
 
     #[error("This offer has already been responded to")]
     OfferAlreadyResponded,
+
+    #[error("No handover has been submitted for this shift")]
+    HandoverNotFound,
+
+    #[error("Not authorized to view this resource")]
+    Forbidden,
+}
+
+/// Which write a clock-in takes. The manual endpoint has always overwritten on
+/// repeat; the LiveKit join path must not, because a rejoin after a dropped
+/// call would otherwise reset `clockin_at` and shorten the worker's paid hours.
+/// Changing the manual endpoint's semantics is a separate, user-visible call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClockinWrite {
+    /// `record_clockin_tx` — last write wins.
+    Overwrite,
+    /// `record_clockin_if_absent_tx` — first write wins.
+    FirstWins,
+}
+
+/// What `virtual_clock_in_on_join` decided. Every variant except a genuine
+/// `Err` is a success from the webhook's point of view; the caller audits the
+/// outcome and returns 200 either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VirtualClockinOutcome {
+    ClockedIn {
+        attendance_id: Uuid,
+        late_minutes: i32,
+        late_penalty_applied: bool,
+    },
+    /// A rejoin, or a concurrent delivery that lost the race.
+    AlreadyClockedIn,
+    NotAssignedClinician,
+    NotVirtualShift,
+    WrongStatus(ShiftStatus),
+    /// More than 60 minutes either side of `scheduled_start`.
+    OutsideWindow { minutes_from_start: i64 },
+    NoClinicianProfile,
+}
+
+impl VirtualClockinOutcome {
+    /// Audit label for `video_session_events.event_type`.
+    pub fn audit_reason(&self) -> String {
+        match self {
+            VirtualClockinOutcome::ClockedIn { .. } => "clockin_recorded".to_string(),
+            VirtualClockinOutcome::AlreadyClockedIn => "clockin_skipped:already_clocked_in".to_string(),
+            VirtualClockinOutcome::NotAssignedClinician => {
+                "clockin_skipped:not_assigned_clinician".to_string()
+            }
+            VirtualClockinOutcome::NotVirtualShift => "clockin_skipped:not_virtual_shift".to_string(),
+            VirtualClockinOutcome::WrongStatus(status) => {
+                format!("clockin_skipped:wrong_status:{status:?}")
+            }
+            VirtualClockinOutcome::OutsideWindow { .. } => "clockin_skipped:outside_window".to_string(),
+            VirtualClockinOutcome::NoClinicianProfile => {
+                "clockin_skipped:no_clinician_profile".to_string()
+            }
+        }
+    }
 }
 
 /// A worker's origin for nearby-shift discovery: live GPS supplied on the
@@ -136,6 +195,13 @@ pub struct WorkerOrigin {
     pub lat: f64,
     pub lng: f64,
     pub accuracy_meters: Option<f32>,
+}
+
+/// Service-layer result for the nearby-shifts query: the ranked shift cards
+/// plus whether the worker had no usable origin (live GPS or stored).
+pub struct NearbyShiftsResult {
+    pub location_required: bool,
+    pub shifts: Vec<crate::models::shift::NearbyShiftCard>,
 }
 
 /// Pair each shift requirement with whether it is satisfied by the clinician's
@@ -157,6 +223,24 @@ fn match_qualifications(
             met: held.contains(&req.trim().to_lowercase()),
         })
         .collect()
+}
+
+/// Deep link written into `shifts.virtual_link` for virtual shifts. This is a
+/// link into OUR app, not a LiveKit URL: joining requires a freshly minted,
+/// short-TTL token, so a static URL can never be a join link. The app resolves
+/// this path by calling `POST /api/v1/shifts/{shift_id}/consult/token`.
+///
+/// `None` produces the wizard's preview link, which belongs to no shift yet.
+pub(crate) fn consult_deep_link(shift_id: Option<Uuid>) -> String {
+    let base = std::env::var("APP_PUBLIC_BASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "https://app.nexuscare.com".to_string());
+    let base = base.trim_end_matches('/');
+    match shift_id {
+        Some(id) => format!("{base}/consults/{id}"),
+        None => format!("{base}/consults/preview"),
+    }
 }
 
 pub struct ShiftService {
@@ -255,9 +339,12 @@ impl ShiftService {
             )
             .await?;
 
-        // AC-04 / F1-F15: Generate virtual link for virtual shifts
+        // AC-04 / F1-F15: virtual shifts get an app deep link. Pure string
+        // formatting — the LiveKit room is created lazily on the first
+        // join-token request, so this transaction still makes no network call.
+        // See VideoService::ensure_session_for_shift.
         if shift.shift_type == ShiftType::Virtual {
-            let virtual_link = self.generate_virtual_link(shift.id);
+            let virtual_link = consult_deep_link(Some(shift.id));
             self.shift_repo
                 .update_virtual_link(&mut tx, shift.id, &virtual_link)
                 .await?;
@@ -336,6 +423,46 @@ impl ShiftService {
             .get_by_id(shift_id)
             .await?
             .ok_or(ShiftServiceError::NotFound(shift_id))
+    }
+
+    /// Fetch the handover submitted for a shift, authorizing the viewer: the
+    /// owning hospital (or any super admin) and the assigned worker may read it.
+    pub async fn get_handover_for_viewer(
+        &self,
+        shift_id: Uuid,
+        viewer_user_id: Uuid,
+        viewer_role: crate::models::user::UserRole,
+        viewer_hospital_id: Option<Uuid>,
+    ) -> Result<crate::models::shift::HandoverResponse, ShiftServiceError> {
+        use crate::models::user::UserRole;
+
+        let shift = self
+            .shift_repo
+            .get_by_id(shift_id)
+            .await?
+            .ok_or(ShiftServiceError::NotFound(shift_id))?;
+
+        // Only the owning hospital, a super admin, or the assigned worker.
+        let authorized = match viewer_role {
+            UserRole::SuperAdmin => true,
+            UserRole::HospitalAdmin => viewer_hospital_id == Some(shift.hospital_id),
+            UserRole::HealthWorker => {
+                let clinician_id = self
+                    .shift_repo
+                    .find_clinician_id_for_user(viewer_user_id)
+                    .await?;
+                clinician_id.is_some() && clinician_id == shift.assigned_clinician_id
+            }
+            _ => false,
+        };
+        if !authorized {
+            return Err(ShiftServiceError::Forbidden);
+        }
+
+        self.shift_repo
+            .get_handover(shift_id)
+            .await?
+            .ok_or(ShiftServiceError::HandoverNotFound)
     }
 
     /// Enriched shift detail for the "View Shift Details" screen (SCRUM-25 /
@@ -430,8 +557,16 @@ impl ShiftService {
     pub async fn express_interest(
         &self,
         shift_id: Uuid,
-        clinician_id: Uuid,
+        worker_user_id: Uuid,
     ) -> Result<(), ShiftServiceError> {
+        // The clinician is always the caller: `shift_interests.clinician_id`
+        // references `clinicians (id)`, never `users (id)`.
+        let clinician_id = self
+            .shift_repo
+            .find_clinician_id_for_user(worker_user_id)
+            .await?
+            .ok_or(ShiftServiceError::NoClinicianProfile)?;
+
         let shift = self
             .shift_repo
             .get_by_id(shift_id)
@@ -483,8 +618,15 @@ impl ShiftService {
     pub async fn apply_for_shift(
         &self,
         shift_id: Uuid,
+        worker_user_id: Uuid,
         request: crate::models::shift::ShiftApplicationRequest,
     ) -> Result<(), ShiftServiceError> {
+        let clinician_id = self
+            .shift_repo
+            .find_clinician_id_for_user(worker_user_id)
+            .await?
+            .ok_or(ShiftServiceError::NoClinicianProfile)?;
+
         let shift = self
             .shift_repo
             .get_by_id(shift_id)
@@ -499,7 +641,7 @@ impl ShiftService {
 
         let profile = self
             .shift_repo
-            .get_clinician_profile_snapshot(request.clinician_id)
+            .get_clinician_profile_snapshot(clinician_id)
             .await?
             .ok_or(ShiftServiceError::ProfileIncomplete)?;
 
@@ -518,7 +660,7 @@ impl ShiftService {
 
         if self
             .shift_repo
-            .clinician_has_active_assignment(request.clinician_id)
+            .clinician_has_active_assignment(clinician_id)
             .await?
         {
             return Err(ShiftServiceError::ClinicianBusy);
@@ -536,7 +678,7 @@ impl ShiftService {
             .create_application(
                 &mut tx,
                 shift_id,
-                request.clinician_id,
+                clinician_id,
                 &verified_applicant_name,
                 &verified_license_number,
                 &verified_role,
@@ -547,6 +689,12 @@ impl ShiftService {
 
         match result {
             Ok(_) => {
+                // `offer_shift` will only offer to a clinician who has expressed
+                // interest, so applying has to record interest too — otherwise
+                // an application is a dead end for the hospital.
+                self.shift_repo
+                    .add_interest_tx(&mut tx, shift_id, clinician_id)
+                    .await?;
                 tx.commit().await?;
                 Ok(())
             }
@@ -1077,7 +1225,7 @@ impl ShiftService {
         worker_user_id: Uuid,
         request: crate::models::shift::ClockinRequest,
     ) -> Result<crate::models::shift::ClockinResponse, ShiftServiceError> {
-        use crate::models::shift::{ClockinMethod, ClockinResponse, ShiftType};
+        use crate::models::shift::{ClockinMethod, ShiftType};
 
         let clinician_id = self
             .shift_repo
@@ -1191,30 +1339,163 @@ impl ShiftService {
             }
         };
 
+        // `Overwrite` keeps this endpoint's long-standing last-write-wins
+        // behaviour; only the LiveKit join path is first-wins.
+        self.persist_clock_in(
+            ClockinWrite::Overwrite,
+            shift_id,
+            clinician_id,
+            &request.method,
+            latitude,
+            longitude,
+            distance_meters,
+            late_minutes,
+            late_penalty_applied,
+            now,
+        )
+        .await?
+        // Unreachable: `record_clockin_tx` always returns a row.
+        .ok_or_else(|| ShiftServiceError::DatabaseError(sqlx::Error::RowNotFound))
+    }
+
+    /// Write the clock-in and return the endpoint's response body.
+    ///
+    /// `now` is a parameter rather than re-derived here on purpose: the SQL
+    /// writes `NOW()`, but the response must echo the same instant the
+    /// late-minutes maths was computed from.
+    ///
+    /// Returns `None` only under [`ClockinWrite::FirstWins`], when a clock-in
+    /// already existed.
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_clock_in(
+        &self,
+        write: ClockinWrite,
+        shift_id: Uuid,
+        clinician_id: Uuid,
+        method: &crate::models::shift::ClockinMethod,
+        latitude: Option<f64>,
+        longitude: Option<f64>,
+        distance_meters: Option<f64>,
+        late_minutes: i32,
+        late_penalty_applied: bool,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<crate::models::shift::ClockinResponse>, ShiftServiceError> {
+        use crate::models::shift::ClockinResponse;
+
         let mut tx = self.pool.begin().await?;
-        let attendance_id = self
-            .shift_repo
-            .record_clockin_tx(
-                &mut tx,
-                shift_id,
-                clinician_id,
-                &request.method,
-                latitude,
-                longitude,
-                distance_meters.map(|d| d as f32),
-                late_minutes,
-                late_penalty_applied,
-            )
-            .await?;
+        let attendance_id = match write {
+            ClockinWrite::Overwrite => Some(
+                self.shift_repo
+                    .record_clockin_tx(
+                        &mut tx,
+                        shift_id,
+                        clinician_id,
+                        method,
+                        latitude,
+                        longitude,
+                        distance_meters.map(|d| d as f32),
+                        late_minutes,
+                        late_penalty_applied,
+                    )
+                    .await?,
+            ),
+            ClockinWrite::FirstWins => {
+                self.shift_repo
+                    .record_clockin_if_absent_tx(
+                        &mut tx,
+                        shift_id,
+                        clinician_id,
+                        method,
+                        late_minutes,
+                        late_penalty_applied,
+                    )
+                    .await?
+            }
+        };
         tx.commit().await?;
 
-        Ok(ClockinResponse {
+        Ok(attendance_id.map(|attendance_id| ClockinResponse {
             attendance_id,
             shift_id,
             clockin_at: now,
             distance_meters,
             late_minutes,
             late_penalty_applied,
+        }))
+    }
+
+    /// Clock a worker in because LiveKit reported them joining the consult.
+    ///
+    /// Applies exactly the guards `clock_in` applies, but every rejection is an
+    /// outcome rather than an error: a webhook has nobody to return a 409 to,
+    /// and a poison event must not be retried forever. Only a genuine `Err` is
+    /// worth retrying, which is what releases the clock-in slot upstream.
+    pub async fn virtual_clock_in_on_join(
+        &self,
+        shift_id: Uuid,
+        worker_user_id: Uuid,
+    ) -> Result<VirtualClockinOutcome, ShiftServiceError> {
+        use crate::models::shift::ClockinMethod;
+
+        let Some(clinician_id) = self
+            .shift_repo
+            .find_clinician_id_for_user(worker_user_id)
+            .await?
+        else {
+            return Ok(VirtualClockinOutcome::NoClinicianProfile);
+        };
+
+        let shift = self
+            .shift_repo
+            .get_by_id(shift_id)
+            .await?
+            .ok_or(ShiftServiceError::NotFound(shift_id))?;
+
+        if shift.assigned_clinician_id != Some(clinician_id) {
+            return Ok(VirtualClockinOutcome::NotAssignedClinician);
+        }
+
+        if shift.shift_type != ShiftType::Virtual {
+            return Ok(VirtualClockinOutcome::NotVirtualShift);
+        }
+
+        if !matches!(shift.status, ShiftStatus::Assigned | ShiftStatus::Upcoming) {
+            return Ok(VirtualClockinOutcome::WrongStatus(shift.status));
+        }
+
+        // Same ±60 minute window as `clock_in`.
+        let now = Utc::now();
+        let minutes_from_start = now
+            .signed_duration_since(shift.scheduled_start)
+            .num_minutes();
+        if !(-60..=60).contains(&minutes_from_start) {
+            return Ok(VirtualClockinOutcome::OutsideWindow { minutes_from_start });
+        }
+        let late_minutes = minutes_from_start.max(0) as i32;
+        let late_penalty_applied = (15..30).contains(&late_minutes);
+
+        let recorded = self
+            .persist_clock_in(
+                ClockinWrite::FirstWins,
+                shift_id,
+                clinician_id,
+                &ClockinMethod::Virtual,
+                None,
+                None,
+                None,
+                late_minutes,
+                late_penalty_applied,
+                now,
+            )
+            .await?;
+
+        Ok(match recorded {
+            Some(response) => VirtualClockinOutcome::ClockedIn {
+                attendance_id: response.attendance_id,
+                late_minutes,
+                late_penalty_applied,
+            },
+            None => VirtualClockinOutcome::AlreadyClockedIn,
         })
     }
 
@@ -1269,6 +1550,14 @@ impl ShiftService {
 
         let critical_patients = serde_json::Value::Array(request.critical_patients.clone());
         let pending_tasks = serde_json::Value::Array(request.pending_tasks.clone());
+        // Cloudinary URLs the frontend attached, stored as a JSON string array.
+        let image_urls = serde_json::Value::Array(
+            request
+                .image_urls
+                .iter()
+                .map(|u| serde_json::Value::String(u.clone()))
+                .collect(),
+        );
 
         let row = self
             .shift_repo
@@ -1279,10 +1568,78 @@ impl ShiftService {
                 &pending_tasks,
                 &request.instructions,
                 request.equipment_status.as_deref(),
+                &image_urls,
             )
             .await?;
 
         Ok(row)
+    }
+
+    /// Worker raises a reminder/appeal when the hospital hasn't approved the
+    /// handover within a day. Records the appeal and emails the hospital.
+    pub async fn appeal_handover(
+        &self,
+        shift_id: Uuid,
+        worker_user_id: Uuid,
+        note: Option<String>,
+    ) -> Result<crate::models::shift::HandoverResponse, ShiftServiceError> {
+        let shift = self
+            .shift_repo
+            .get_by_id(shift_id)
+            .await?
+            .ok_or(ShiftServiceError::NotFound(shift_id))?;
+
+        // Only the assigned worker may appeal their own handover.
+        let clinician_id = self
+            .shift_repo
+            .find_clinician_id_for_user(worker_user_id)
+            .await?;
+        if clinician_id.is_none() || clinician_id != shift.assigned_clinician_id {
+            return Err(ShiftServiceError::Forbidden);
+        }
+
+        let handover = self
+            .shift_repo
+            .get_handover(shift_id)
+            .await?
+            .ok_or(ShiftServiceError::HandoverNotFound)?;
+        if handover.hospital_approved_at.is_some() {
+            return Err(ShiftServiceError::InvalidStatus(
+                "Handover has already been approved".to_string(),
+            ));
+        }
+        if handover.appeal_raised_at.is_some() {
+            return Err(ShiftServiceError::InvalidStatus(
+                "An appeal has already been raised for this handover".to_string(),
+            ));
+        }
+
+        // The repo guard enforces the one-day wait atomically.
+        let raised = self
+            .shift_repo
+            .raise_handover_appeal(shift_id, note.as_deref())
+            .await?;
+        if raised.is_none() {
+            return Err(ShiftServiceError::InvalidStatus(
+                "You can only appeal a day after submitting the handover".to_string(),
+            ));
+        }
+
+        // Nudge the hospital by email (best-effort).
+        if let Ok(Some((_hospital_name, hospital_email))) =
+            self.shift_repo.get_hospital_contact(shift.hospital_id).await
+        {
+            let content =
+                email_templates::handover_appeal_raised(&shift.role_title, note.as_deref());
+            if let Err(e) = self.email_outbox.enqueue_email(&hospital_email, &content).await {
+                eprintln!("Warning: Failed to queue handover appeal email: {e}");
+            }
+        }
+
+        self.shift_repo
+            .get_handover(shift_id)
+            .await?
+            .ok_or(ShiftServiceError::HandoverNotFound)
     }
 
     /// Worker clocks out. Requires a submitted handover
@@ -1636,7 +1993,7 @@ impl ShiftService {
         radius_km: f64,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<crate::models::shift::NearbyShiftCard>, ShiftServiceError> {
+    ) -> Result<NearbyShiftsResult, ShiftServiceError> {
         use crate::models::shift::NearbyShiftCard;
 
         let clinician_id = self
@@ -1646,24 +2003,22 @@ impl ShiftService {
             .ok_or(ShiftServiceError::NoClinicianProfile)?;
 
         // Resolve the origin: live GPS wins and is persisted; otherwise fall
-        // back to the last-known location; otherwise ask the caller for one.
-        let (origin_lat, origin_lng) = match origin {
+        // back to the last-known location; otherwise proceed without one and
+        // flag that the client should prompt for location access.
+        let origin_coords: Option<(f64, f64)> = match origin {
             Some(o) => {
                 self.shift_repo
                     .upsert_clinician_location(clinician_id, o.lat, o.lng, o.accuracy_meters)
                     .await?;
-                (o.lat, o.lng)
+                Some((o.lat, o.lng))
             }
-            None => self
-                .shift_repo
-                .get_clinician_location(clinician_id)
-                .await?
-                .ok_or(ShiftServiceError::LocationRequired)?,
+            None => self.shift_repo.get_clinician_location(clinician_id).await?,
         };
+        let location_required = origin_coords.is_none();
 
         let rows = self
             .shift_repo
-            .list_nearby_shifts(clinician_id, origin_lat, origin_lng, radius_km, limit, offset)
+            .list_nearby_shifts(clinician_id, origin_coords, radius_km, limit, offset)
             .await?;
 
         // Rows arrive already filtered, ranked and paged; map them 1:1.
@@ -1688,7 +2043,10 @@ impl ShiftService {
             })
             .collect();
 
-        Ok(cards)
+        Ok(NearbyShiftsResult {
+            location_required,
+            shifts: cards,
+        })
     }
 
     /// "My Applications" tab. Combines expressed interests and
@@ -2067,8 +2425,10 @@ impl ShiftService {
         }
 
         // Validate pay type requirements + F1-F08/F1-F09 minimum rates.
-        const MIN_HOURLY_KOBO: i64 = 200_000; // ₦2,000
-        const MIN_FIXED_KOBO: i64 = 1_000_000; // ₦10,000
+        // TEMPORARY: lowered to ₦100 for live testing. Revert to
+        // 200_000 (₦2,000) / 1_000_000 (₦10,000) after testing.
+        const MIN_HOURLY_KOBO: i64 = 10_000; // ₦100
+        const MIN_FIXED_KOBO: i64 = 10_000; // ₦100
         match request.pay_type {
             crate::models::shift::PayType::HourlyRate => {
                 let rate = request.rate_kobo_per_hour.ok_or_else(|| {
@@ -2078,7 +2438,7 @@ impl ShiftService {
                 })?;
                 if rate < MIN_HOURLY_KOBO {
                     return Err(ShiftServiceError::ValidationError(
-                        "Hourly rate must be at least ₦2,000".to_string(),
+                        "Hourly rate must be at least ₦100".to_string(),
                     ));
                 }
             }
@@ -2090,7 +2450,7 @@ impl ShiftService {
                 })?;
                 if rate < MIN_FIXED_KOBO {
                     return Err(ShiftServiceError::ValidationError(
-                        "Fixed rate must be at least ₦10,000".to_string(),
+                        "Fixed rate must be at least ₦100".to_string(),
                     ));
                 }
             }
@@ -2165,11 +2525,6 @@ impl ShiftService {
         }
 
         Ok(())
-    }
-
-    /// Generate virtual meeting link for virtual shifts
-    fn generate_virtual_link(&self, shift_id: Uuid) -> String {
-        format!("https://meet.nexuscare.com/shift/{}", shift_id)
     }
 
     /// Calculate matched clinicians based on shift type and location
@@ -2632,7 +2987,7 @@ impl ShiftService {
             stat_bonus_kobo: stat_bonus,
             grand_total_kobo: grand_total,
             virtual_link: if request.shift_type == ShiftType::Virtual {
-                Some("https://meet.nexuscare.com/shift/preview".to_string())
+                Some(consult_deep_link(None))
             } else {
                 None
             },
@@ -2720,5 +3075,67 @@ mod qualification_match_tests {
     fn no_quals_meets_nothing() {
         let result = match_qualifications(&v(&["X", "Y"]), &[]);
         assert!(result.iter().all(|m| !m.met));
+    }
+}
+
+#[cfg(test)]
+mod consult_deep_link_tests {
+    //! `shifts.virtual_link` is an app deep link, not a LiveKit URL (§2.3).
+    use super::consult_deep_link;
+    use std::sync::Mutex;
+    use uuid::Uuid;
+
+    /// `APP_PUBLIC_BASE_URL` is process-global, so these cases cannot run
+    /// concurrently with each other.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+    fn with_base_url<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("APP_PUBLIC_BASE_URL").ok();
+        match value {
+            Some(v) => std::env::set_var("APP_PUBLIC_BASE_URL", v),
+            None => std::env::remove_var("APP_PUBLIC_BASE_URL"),
+        }
+        let result = f();
+        match previous {
+            Some(v) => std::env::set_var("APP_PUBLIC_BASE_URL", v),
+            None => std::env::remove_var("APP_PUBLIC_BASE_URL"),
+        }
+        result
+    }
+
+    #[test]
+    fn falls_back_to_the_default_host_when_unset() {
+        let id = Uuid::new_v4();
+        let link = with_base_url(None, || consult_deep_link(Some(id)));
+        assert_eq!(link, format!("https://app.nexuscare.com/consults/{id}"));
+    }
+
+    #[test]
+    fn uses_the_configured_base_url() {
+        let id = Uuid::new_v4();
+        let link = with_base_url(Some("https://app.example.test"), || consult_deep_link(Some(id)));
+        assert_eq!(link, format!("https://app.example.test/consults/{id}"));
+    }
+
+    #[test]
+    fn a_trailing_slash_does_not_double_up() {
+        let id = Uuid::new_v4();
+        let link = with_base_url(Some("https://app.example.test/"), || consult_deep_link(Some(id)));
+        assert_eq!(link, format!("https://app.example.test/consults/{id}"));
+    }
+
+    #[test]
+    fn a_blank_base_url_is_treated_as_unset() {
+        let id = Uuid::new_v4();
+        let link = with_base_url(Some("   "), || consult_deep_link(Some(id)));
+        assert_eq!(link, format!("https://app.nexuscare.com/consults/{id}"));
+    }
+
+    /// The wizard preview has no shift yet.
+    #[test]
+    fn preview_has_no_shift_id() {
+        let link = with_base_url(Some("https://app.example.test"), || consult_deep_link(None));
+        assert_eq!(link, "https://app.example.test/consults/preview");
     }
 }

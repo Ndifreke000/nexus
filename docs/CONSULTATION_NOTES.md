@@ -41,7 +41,7 @@ transcript grows in ~10s steps as each chunk finishes, not word-by-word.
 True streaming would need a websocket + incremental decoding on the
 ml-service side — a materially bigger lift, and not needed yet.
 
-## Schema (`migrations/20240042_create_consultation_notes.sql`)
+## Schema (`migrations/20240062_create_consultation_notes.sql`)
 
 - **`consultation_notes`** — one row per consultation. `status` is
   `recording` → `completed` (or `failed` if abandoned). `full_transcript`

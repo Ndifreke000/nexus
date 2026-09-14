@@ -20,9 +20,9 @@ use utoipa::{
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
-    admin, auth, clinician_registration, consultation_notes, distance, earnings, health,
+    admin, auth, clinician_registration, consultation_notes, distance, earnings, emails, health,
     here_maps, hospitals, identity, location, notifications, patients, pipeline, registration,
-    shifts, wallet, webhooks,
+    shifts, uploads, video, wallet, webhooks,
 };
 use crate::repositories::{
     admin::AdminRepository, audit::AuditRepository, billing::BillingRepository,
@@ -30,7 +30,7 @@ use crate::repositories::{
     hospital::HospitalRepository, identity_verification::IdentityVerificationRepository,
     location::LocationRepository, notification::NotificationRepository,
     patient::PatientRepository, patient_prediction::PatientPredictionRepository,
-    shift::ShiftRepository, wallet::WalletRepository,
+    shift::ShiftRepository, video_session::VideoSessionRepository, wallet::WalletRepository,
 };
 use crate::services::{
     admin_service::AdminService, audit_service::AuditService, auth_service::AuthService,
@@ -38,12 +38,13 @@ use crate::services::{
     consultation_note_service::ConsultationNoteService, distance_service::DistanceService,
     email_outbox_service::EmailOutboxService, encryption::EncryptionService, fcm::FcmClient,
     geocoding::GeocodingClient, here_maps::HereMapsClient,
-    identity_verification_service::IdentityVerificationService, location_service::LocationService,
-    ml_client::MlClient, notification_service::NotificationService,
-    patient_prediction_service::PatientPredictionService, payout_service::PayoutService,
-    push_service::PushService,
+    identity_verification_service::IdentityVerificationService,
+    livekit::LiveKitClient, location_service::LocationService, ml_client::MlClient,
+    notification_service::NotificationService,
+    patient_prediction_service::PatientPredictionService,
+    payout_service::PayoutService, push_service::PushService,
     registration_service::RegistrationService, safehaven::SafeHavenClient,
-    shift_service::ShiftService, wallet_service::WalletService,
+    shift_service::ShiftService, video_service::VideoService, wallet_service::WalletService,
 };
 
 #[derive(Clone)]
@@ -62,10 +63,12 @@ pub struct AppState {
     pub here_maps_client: Arc<HereMapsClient>,
     pub distance_service: Arc<DistanceService>,
     pub push_service: Arc<PushService>,
+    pub email_outbox: Arc<EmailOutboxService>,
     pub patient_repo: Arc<PatientRepository>,
     pub patient_prediction_service: Arc<PatientPredictionService>,
     pub pipeline_events: Arc<tokio::sync::broadcast::Sender<crate::models::patient_prediction::PipelineEvent>>,
     pub consultation_note_service: Arc<ConsultationNoteService>,
+    pub video_service: Arc<VideoService>,
 }
 
 #[derive(OpenApi)]
@@ -76,9 +79,16 @@ pub struct AppState {
         // Auth
         crate::handlers::auth::email_otp_send,
         crate::handlers::auth::email_otp_verify,
+        crate::handlers::auth::admin_login,
+        crate::handlers::hospitals::get_hospital,
+        crate::handlers::hospitals::get_hospital_location,
+        crate::handlers::clinician_registration::get_worker_public,
+        crate::handlers::clinician_registration::set_avatar,
+        crate::handlers::uploads::upload_signature,
         crate::handlers::auth::me,
         crate::handlers::auth::refresh_token,
         crate::handlers::auth::logout,
+        crate::handlers::emails::send_email,
         crate::handlers::registration::register_hospital,
         crate::handlers::registration::list_hospitals,
         crate::handlers::registration::get_registration_status,
@@ -117,6 +127,8 @@ pub struct AppState {
         crate::handlers::shifts::decline_shift,
         crate::handlers::shifts::clock_in,
         crate::handlers::shifts::submit_handover,
+        crate::handlers::shifts::get_handover,
+        crate::handlers::shifts::appeal_handover,
         crate::handlers::shifts::clock_out,
         crate::handlers::shifts::request_handover_revision,
         crate::handlers::shifts::approve_handover,
@@ -164,6 +176,11 @@ pub struct AppState {
         crate::handlers::admin::create_admin,
         crate::handlers::admin::list_admins,
         crate::handlers::admin::update_admin,
+        crate::handlers::admin::get_hospital_detail,
+        crate::handlers::admin::get_worker_detail,
+        crate::handlers::admin::metrics_revenue_trend,
+        crate::handlers::admin::recent_activities,
+        crate::handlers::admin::global_search,
         // Patients / ML pipeline
         crate::handlers::patients::ingest_patient,
         crate::handlers::patients::get_patient,
@@ -181,14 +198,24 @@ pub struct AppState {
         crate::handlers::wallet::get_ledger,
         crate::handlers::wallet::create_deposit,
         crate::handlers::wallet::list_deposits,
+        crate::handlers::wallet::reconcile_deposits,
+        crate::handlers::wallet::withdraw,
+        crate::handlers::wallet::list_withdrawals,
+        crate::handlers::wallet::get_withdrawal_status,
         crate::handlers::wallet::initiate_sub_account,
         crate::handlers::wallet::provision_sub_account,
         crate::handlers::wallet::list_payouts,
         crate::handlers::wallet::get_payout_status,
         crate::handlers::wallet::get_statement,
         crate::handlers::wallet::retry_payout,
+        // Virtual consultations (LiveKit)
+        crate::handlers::video::issue_join_token,
+        crate::handlers::video::get_session,
+        crate::handlers::video::leave_session,
+        crate::handlers::video::end_session,
         // Webhooks
         crate::handlers::webhooks::safehaven_webhook,
+        crate::handlers::webhooks::livekit_webhook,
         // Earnings
         crate::handlers::earnings::get_earnings,
         // Notifications & devices
@@ -199,6 +226,9 @@ pub struct AppState {
     ),
     components(
         schemas(
+            // Emails
+            crate::handlers::emails::SendEmailRequest,
+            crate::handlers::emails::SendEmailResponse,
             // Registration
             crate::handlers::registration::HospitalRegistrationResponse,
             crate::handlers::registration::StatusChangeResponse,
@@ -223,6 +253,7 @@ pub struct AppState {
             crate::models::shift::ClockinMethod,
             crate::models::shift::SubmitHandoverRequest,
             crate::models::shift::HandoverResponse,
+            crate::models::shift::HandoverAppealRequest,
             crate::models::shift::ClockoutResponse,
             crate::models::shift::HandoverRevisionRequest,
             crate::models::shift::HospitalRatingDimensions,
@@ -231,6 +262,7 @@ pub struct AppState {
             crate::models::shift::EditRatingRequest,
             crate::models::shift::RatingResponse,
             crate::models::shift::NearbyShiftCard,
+            crate::models::shift::NearbyShiftsResponse,
             crate::models::shift::ShiftDetailResponse,
             crate::models::shift::HospitalRatingSummary,
             crate::models::shift::QualificationMatch,
@@ -239,6 +271,21 @@ pub struct AppState {
             crate::models::shift::ClockinApprovalRequest,
             crate::models::shift::ClockinApprovalDecisionRequest,
             crate::models::shift::ClockinApprovalRecord,
+            // Virtual consultations (LiveKit). No ErrorResponse here on
+            // purpose — video.rs reuses the shifts one.
+            crate::models::video_session::JoinConsultRequest,
+            crate::models::video_session::JoinConsultResponse,
+            crate::models::video_session::ConsultSessionView,
+            crate::models::video_session::ConsultParticipantView,
+            crate::models::video_session::ConsultShiftSummary,
+            crate::models::video_session::ConsultClockInView,
+            crate::models::video_session::ConsultRecordingView,
+            crate::models::video_session::EndConsultRequest,
+            crate::models::video_session::EndConsultResponse,
+            crate::models::video_session::LeaveConsultResponse,
+            crate::models::video_session::ParticipantRole,
+            crate::models::video_session::JoinMode,
+            crate::models::video_session::VideoSessionStatus,
             // Patients / ML pipeline
             crate::models::patient::NewPatientRequest,
             crate::models::patient::PatientResponse,
@@ -261,6 +308,13 @@ pub struct AppState {
             crate::models::wallet::WalletDepositRequest,
             crate::models::wallet::CreateDepositRequest,
             crate::models::wallet::DepositResponse,
+            crate::models::wallet::DepositInstructions,
+            crate::models::wallet::WithdrawRequest,
+            crate::models::wallet::WithdrawResponse,
+            crate::models::wallet::WithdrawalRow,
+            crate::handlers::wallet::WithdrawalPage,
+            crate::handlers::wallet::WithdrawalStatusResponse,
+            crate::services::wallet_service::ReconcileResult,
             crate::handlers::wallet::LedgerPage,
             crate::handlers::wallet::PayoutPage,
             crate::handlers::wallet::PayoutStatusResponse,
@@ -307,6 +361,16 @@ pub struct AppState {
             crate::models::admin::CreateAdminRequest,
             crate::models::admin::UpdateAdminRequest,
             crate::models::admin::AdminSummary,
+            crate::models::admin::HospitalDetail,
+            crate::models::admin::WorkerDetail,
+            crate::models::admin::RevenuePoint,
+            crate::models::admin::RevenueTrend,
+            crate::models::admin::ActivityItem,
+            crate::models::admin::SearchHit,
+            crate::models::admin::SearchResults,
+            crate::handlers::admin::RevenueTrendQuery,
+            crate::handlers::admin::ActivitiesQuery,
+            crate::handlers::admin::SearchQuery,
             // Models
             crate::models::admin_registration::HospitalRegistrationRequest,
             crate::models::admin_registration::Address,
@@ -325,12 +389,14 @@ pub struct AppState {
             crate::models::shift::ShiftApplicationStatus,
             crate::models::shift::ShiftApplicationsQuery,
             crate::models::shift::ShiftListQuery,
-            crate::models::shift::ShiftInterestRequest,
             crate::models::shift::ShiftAssignRequest,
             crate::models::shift::ShiftCancelRequest,
             crate::models::shift::ShiftRescheduleRequest,
             crate::models::user::UserResponse,
+            crate::models::user::LoginRequest,
             crate::models::user::LoginResponse,
+            crate::models::hospital::HospitalPublicDetail,
+            crate::models::clinician::WorkerPublicDetail,
             crate::handlers::auth::MeResponse,
             crate::handlers::auth::ClinicianProfile,
             crate::handlers::auth::HospitalProfile,
@@ -346,6 +412,9 @@ pub struct AppState {
             crate::models::clinician_registration::ProfileResponse,
             crate::models::clinician_registration::AddBankAccountRequest,
             crate::models::clinician_registration::BankAccountResponse,
+            crate::models::clinician_registration::SetAvatarRequest,
+            crate::handlers::hospitals::HospitalLocationResponse,
+            crate::services::cloudinary::SignedUpload,
             crate::models::clinician::ClinicianAdminSummary,
             // Identity verification
             crate::handlers::identity::InitiateIdentityRequest,
@@ -407,10 +476,12 @@ pub struct AppState {
         (name = "location", description = "Location services — nearby facilities, address autocomplete, HERE Maps integration"),
         (name = "admin", description = "Admin-only endpoints"),
         (name = "wallet", description = "Hospital wallet — balance, deposits, ledger (Tier 2)"),
-        (name = "webhooks", description = "Inbound webhooks from external providers (SafeHaven)"),
+        (name = "video", description = "Virtual consultations — LiveKit rooms, join tokens, and session state"),
+        (name = "webhooks", description = "Inbound webhooks from external providers (SafeHaven, LiveKit)"),
         (name = "earnings", description = "Worker earnings — totals + transaction history"),
         (name = "identity", description = "BVN/NIN identity verification and bank list"),
-        (name = "notifications", description = "Device push-token registration and the in-app notification center")
+        (name = "notifications", description = "Device push-token registration and the in-app notification center"),
+        (name = "emails", description = "Generic frontend-templated transactional email relay")
     ),
     modifiers(&SecurityAddon)
 )]
@@ -528,7 +599,7 @@ pub fn create_router(
 
     // Initialize shift service
     let shift_service = Arc::new(ShiftService::new(
-        shift_repo,
+        shift_repo.clone(),
         pool.clone(),
         notification_service.clone(),
         email_outbox_service.clone(),
@@ -545,8 +616,24 @@ pub fn create_router(
         encryption_service.clone(),
     ));
 
+    // LiveKit video consultations. Mock unless LIVEKIT_API_KEY/SECRET are set,
+    // so local dev and CI need no credentials. VideoService depends on
+    // ShiftService and never the reverse, which is why there is no Arc cycle.
+    let livekit_client = Arc::new(LiveKitClient::from_env());
+    if livekit_client.is_mock() {
+        tracing::warn!("LiveKit running in MOCK mode — join tokens are fake");
+    }
+    let video_repo = Arc::new(VideoSessionRepository::new(pool.clone()));
+    let video_service = Arc::new(VideoService::new(
+        video_repo,
+        shift_repo.clone(),
+        shift_service.clone(),
+        livekit_client,
+        push_service.clone(),
+    ));
+
     let admin_repo = Arc::new(AdminRepository::new(pool.clone()));
-    let admin_service = Arc::new(AdminService::new(admin_repo));
+    let admin_service = Arc::new(AdminService::new(admin_repo, email_outbox_service.clone()));
 
     // ML pipeline: patient intake -> ml-service -> SSE. An empty
     // ML_SERVICE_URL flips MlClient into mock mode (mirrors SafeHavenClient).
@@ -586,10 +673,12 @@ pub fn create_router(
         here_maps_client,
         distance_service,
         push_service,
-        patient_repo,
+        email_outbox: email_outbox_service.clone(),
+        patient_repo: patient_repo.clone(),
         patient_prediction_service,
         pipeline_events,
         consultation_note_service,
+        video_service,
     };
 
     let api_router = Router::new()
@@ -598,8 +687,11 @@ pub fn create_router(
         // Auth (OTP-only).
         .route("/api/v1/auth/otp/send", post(auth::email_otp_send))
         .route("/api/v1/auth/otp/verify", post(auth::email_otp_verify))
+        .route("/api/v1/auth/admin/login", post(auth::admin_login))
         .route("/api/v1/auth/refresh", post(auth::refresh_token))
         .route("/api/v1/auth/logout", post(auth::logout))
+        // Generic frontend-templated email relay (authenticated).
+        .route("/api/v1/emails/send", post(emails::send_email))
         .route("/api/v1/auth/me", get(auth::me))
         // Hospital Registration
         .route(
@@ -619,6 +711,10 @@ pub fn create_router(
         .route("/api/v1/hospitals/{id}", get(hospitals::get_hospital))
         .route("/api/v1/hospitals/{id}", patch(hospitals::update_hospital))
         .route(
+            "/api/v1/hospitals/{id}/location",
+            get(hospitals::get_hospital_location),
+        )
+        .route(
             "/api/v1/hospitals/{id}/advance-step",
             patch(hospitals::advance_registration_step),
         )
@@ -631,15 +727,38 @@ pub fn create_router(
             "/api/v1/clinicians/otp/verify",
             post(clinician_registration::verify_otp),
         )
+        // Public (ungated) worker profile.
+        .route(
+            "/api/v1/workers/{id}",
+            get(clinician_registration::get_worker_public),
+        )
+        // Own-profile onboarding: role-gated here, ownership checked in the
+        // handlers (the clinician id comes from the path).
         .route(
             "/api/v1/clinicians/{clinician_id}/profile",
-            axum::routing::put(clinician_registration::complete_profile),
+            axum::routing::put(clinician_registration::complete_profile)
+                .route_layer(from_fn(require_role(&[UserRole::HealthWorker]))),
         )
         .route(
             "/api/v1/clinicians/{clinician_id}/bank-account",
-            post(clinician_registration::add_bank_account),
+            post(clinician_registration::add_bank_account)
+                .route_layer(from_fn(require_role(&[UserRole::HealthWorker]))),
+        )
+        .route(
+            "/api/v1/clinicians/{clinician_id}/avatar",
+            patch(clinician_registration::set_avatar)
+                .route_layer(from_fn(require_role(&[UserRole::HealthWorker]))),
+        )
+        // Cloudinary signed-upload signature (any authenticated user)
+        .route(
+            "/api/v1/uploads/signature",
+            get(uploads::upload_signature),
         )
         // Identity verification (BVN/NIN) + bank list
+        .route(
+            "/api/v1/hospitals/{hospital_id}/identity",
+            get(identity::hospital_get_identity),
+        )
         .route(
             "/api/v1/hospitals/{hospital_id}/identity/initiate",
             post(identity::hospital_initiate),
@@ -649,6 +768,10 @@ pub fn create_router(
             post(identity::hospital_validate),
         )
         .route(
+            "/api/v1/clinicians/{clinician_id}/identity",
+            get(identity::clinician_get_identity),
+        )
+        .route(
             "/api/v1/clinicians/{clinician_id}/identity/initiate",
             post(identity::clinician_initiate),
         )
@@ -656,6 +779,7 @@ pub fn create_router(
             "/api/v1/clinicians/{clinician_id}/identity/validate",
             post(identity::clinician_validate),
         )
+
         .route("/api/v1/banks", get(identity::list_banks))
         .route("/api/v1/banks/resolve", post(identity::resolve_account))
         // Location services
@@ -755,11 +879,19 @@ pub fn create_router(
         .route(
             "/api/v1/shifts/{shift_id}/handover",
             post(shifts::submit_handover)
-                .route_layer(from_fn(require_role(&[UserRole::HealthWorker]))),
+                .route_layer(from_fn(require_role(&[UserRole::HealthWorker])))
+                // GET is open at the route level; the handler authorizes the
+                // owning hospital / super admin / assigned worker.
+                .get(shifts::get_handover),
         )
         .route(
             "/api/v1/shifts/{shift_id}/clockout",
             post(shifts::clock_out).route_layer(from_fn(require_role(&[UserRole::HealthWorker]))),
+        )
+        .route(
+            "/api/v1/shifts/{shift_id}/handover/appeal",
+            post(shifts::appeal_handover)
+                .route_layer(from_fn(require_role(&[UserRole::HealthWorker]))),
         )
         .route(
             "/api/v1/shifts/{shift_id}/handover/revision",
@@ -854,6 +986,41 @@ pub fn create_router(
                 UserRole::SuperAdmin,
             ]))),
         )
+        // ---- Virtual consultations (LiveKit). The role guard is coarse on
+        // purpose: VideoService does the fine-grained check against
+        // shifts.assigned_clinician_id / claims.hospital_id, which is the only
+        // place that knows which hospital owns the shift.
+        .route(
+            "/api/v1/shifts/{shift_id}/consult/token",
+            post(video::issue_join_token).route_layer(from_fn(require_role(&[
+                UserRole::HealthWorker,
+                UserRole::HospitalAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/shifts/{shift_id}/consult/leave",
+            post(video::leave_session).route_layer(from_fn(require_role(&[
+                UserRole::HealthWorker,
+                UserRole::HospitalAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/shifts/{shift_id}/consult",
+            get(video::get_session).route_layer(from_fn(require_role(&[
+                UserRole::HealthWorker,
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+                UserRole::OperationsAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/shifts/{shift_id}/consult/end",
+            post(video::end_session).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+                UserRole::OperationsAdmin,
+            ]))),
+        )
         // ---- Wallet — HospitalAdmin/SuperAdmin only.
         .route(
             "/api/v1/wallet",
@@ -877,6 +1044,34 @@ pub fn create_router(
                     UserRole::HospitalAdmin,
                     UserRole::SuperAdmin,
                 ]))),
+        )
+        .route(
+            "/api/v1/wallet/reconcile",
+            post(wallet::reconcile_deposits).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/wallet/withdraw",
+            post(wallet::withdraw).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/wallet/withdrawals",
+            get(wallet::list_withdrawals).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/wallet/withdrawals/{withdrawal_id}/status",
+            get(wallet::get_withdrawal_status).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+            ]))),
         )
         .route(
             "/api/v1/wallet/sub-account/initiate",
@@ -919,6 +1114,8 @@ pub fn create_router(
             "/api/v1/webhooks/safehaven",
             post(webhooks::safehaven_webhook),
         )
+        // Authenticated by LiveKit's own signed JWT, not ours.
+        .route("/api/v1/webhooks/livekit", post(webhooks::livekit_webhook))
         // ---- Worker earnings — HealthWorker only.
         .route(
             "/api/v1/worker/earnings",
@@ -1172,5 +1369,34 @@ fn admin_dashboard_routes() -> Router<AppState> {
             "/api/v1/admin/admins/{id}",
             axum::routing::patch(admin::update_admin)
                 .route_layer(from_fn(require_permission(P::ManageAdmins))),
+        )
+        // Detail views — ViewHospitals / ViewWorkers.
+        .route(
+            "/api/v1/admin/hospitals/{hospital_id}",
+            get(admin::get_hospital_detail)
+                .route_layer(from_fn(require_permission(P::ViewHospitals))),
+        )
+        .route(
+            "/api/v1/admin/workers/{clinician_id}",
+            get(admin::get_worker_detail)
+                .route_layer(from_fn(require_permission(P::ViewWorkers))),
+        )
+        // Revenue trend (time series) — ViewEarnings (financial).
+        .route(
+            "/api/v1/admin/metrics/revenue/trend",
+            get(admin::metrics_revenue_trend)
+                .route_layer(from_fn(require_permission(P::ViewEarnings))),
+        )
+        // Recent activity feed — ViewAnalytics.
+        .route(
+            "/api/v1/admin/activities",
+            get(admin::recent_activities)
+                .route_layer(from_fn(require_permission(P::ViewAnalytics))),
+        )
+        // Global search (hospitals + workers) — ViewHospitals.
+        .route(
+            "/api/v1/admin/search",
+            get(admin::global_search)
+                .route_layer(from_fn(require_permission(P::ViewHospitals))),
         )
 }

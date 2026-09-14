@@ -399,6 +399,40 @@ pub fn handover_auto_approved(clinician_first_name: &str, role_title: &str) -> E
     }
 }
 
+/// Sent to the hospital when a worker appeals an unapproved handover after a day.
+pub fn handover_appeal_raised(role_title: &str, note: Option<&str>) -> EmailContent {
+    let subject = "Handover Awaiting Your Approval - NexusCare".to_string();
+    let note_line = note
+        .filter(|n| !n.trim().is_empty())
+        .map(|n| format!("\nWorker's note: {n}\n"))
+        .unwrap_or_default();
+    let text_body = format!(
+        "Hello,\n\nThe worker for the {} shift is asking you to review and approve their submitted handover. It has been awaiting approval for over a day.\n{}\nPlease approve it, or it will be auto-approved 48 hours after submission.\n\nNexusCare",
+        role_title, note_line
+    );
+    let note_html = note
+        .filter(|n| !n.trim().is_empty())
+        .map(|n| format!("<p style=\"margin:0 0 12px 0;\"><em>Worker's note: {n}</em></p>"))
+        .unwrap_or_default();
+    let html_body = wrap_html(
+        "Handover Awaiting Your Approval",
+        &format!(
+            "<p style=\"margin:0 0 12px 0;\">Hello,</p>
+             <p style=\"margin:0 0 12px 0;\">The worker for the <strong>{}</strong> shift is asking you to review and approve their submitted handover. It has been awaiting approval for over a day.</p>
+             {}
+             <p style=\"margin:0 0 12px 0;\">Please approve it, or it will be auto-approved 48 hours after submission.</p>
+             <p style=\"margin:0;\">NexusCare</p>",
+            role_title, note_html
+        ),
+    );
+
+    EmailContent {
+        subject,
+        text_body,
+        html_body,
+    }
+}
+
 /// Sent to the hospital when a shift offer to a clinician expires
 
 pub fn shift_offer_expired(role_title: &str) -> EmailContent {
@@ -648,6 +682,40 @@ pub fn password_reset(reset_link: &str) -> EmailContent {
             reset_link,
             reset_link,
             reset_link
+        ),
+    );
+
+    EmailContent {
+        subject,
+        text_body,
+        html_body,
+    }
+}
+
+/// Invitation sent to a newly-created sub-admin with their login credentials.
+pub fn admin_invite(
+    first_name: &str,
+    role: &str,
+    email: &str,
+    temp_password: &str,
+    login_url: &str,
+) -> EmailContent {
+    let role_label = role.replace('_', " ");
+    let subject = "You've been invited to the NexusCare admin console".to_string();
+    let text_body = format!(
+        "Hi {first_name},\n\nYou have been invited to the NexusCare admin console as {role_label}.\n\nSign in at: {login_url}\nEmail: {email}\nTemporary password: {temp_password}\n\nPlease sign in and change your password.\n"
+    );
+    let html_body = wrap_html(
+        "Admin invitation",
+        &format!(
+            "<p style=\"margin:0 0 12px 0;\">Hi {first_name},</p>
+             <p style=\"margin:0 0 16px 0;\">You have been invited to the NexusCare admin console as <strong>{role_label}</strong>.</p>
+             <table style=\"margin:0 0 16px 0; font-size:14px;\">
+               <tr><td style=\"padding:2px 8px 2px 0; color:#64748b;\">Email</td><td><strong>{email}</strong></td></tr>
+               <tr><td style=\"padding:2px 8px 2px 0; color:#64748b;\">Temporary password</td><td><strong>{temp_password}</strong></td></tr>
+             </table>
+             <p style=\"margin:0 0 16px 0;\"><a href=\"{login_url}\" style=\"display:inline-block; background:#2563eb; color:#ffffff; text-decoration:none; padding:10px 16px; border-radius:8px; font-weight:bold;\">Sign in</a></p>
+             <p style=\"margin:0; color:#64748b; font-size:13px;\">Please sign in and change your password as soon as possible.</p>"
         ),
     );
 

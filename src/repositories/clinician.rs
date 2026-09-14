@@ -23,6 +23,19 @@ impl ClinicianRepository {
         Self { pool }
     }
 
+    /// Resolve `clinicians.id` from the authenticated user's `users.id`.
+    /// `clinicians.user_id` is `NOT NULL UNIQUE`, so at most one row matches.
+    pub async fn find_id_by_user_id(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<Uuid>, ClinicianRepoError> {
+        let id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM clinicians WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(id)
+    }
+
     /// Check if email is already registered
     pub async fn email_exists(&self, email: &str) -> Result<bool, ClinicianRepoError> {
         let row: Option<(i64,)> = sqlx::query_as("SELECT COUNT(*) FROM users WHERE email = $1")
@@ -117,6 +130,40 @@ impl ClinicianRepository {
         Ok(())
     }
 
+    /// Set the clinician's profile image URL (and mirror it onto the linked
+    /// user row). `url` is a Cloudinary secure URL the frontend already uploaded.
+    pub async fn set_avatar_url(
+        &self,
+        clinician_id: Uuid,
+        url: &str,
+    ) -> Result<(), ClinicianRepoError> {
+        sqlx::query(
+            r#"
+            UPDATE users u
+               SET avatar_url = $2, updated_at = NOW()
+              FROM clinicians c
+             WHERE c.id = $1 AND c.user_id = u.id
+            "#,
+        )
+        .bind(clinician_id)
+        .bind(url)
+        .execute(&self.pool)
+        .await?;
+
+        let result = sqlx::query(
+            r#"UPDATE clinicians SET avatar_url = $2, updated_at = NOW() WHERE id = $1"#,
+        )
+        .bind(clinician_id)
+        .bind(url)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(ClinicianRepoError::NotFound);
+        }
+        Ok(())
+    }
+
     /// Upsert bank account (encrypted account number)
     pub async fn upsert_bank_account(
         &self,
@@ -191,9 +238,15 @@ impl ClinicianRepository {
             r#"
             SELECT c.id, c.user_id, c.first_name, c.last_name, u.email,
                    c.license_number, c.clinician_role as role, c.specialty,
-                   c.is_verified, c.is_active, c.created_at
+                   c.is_verified, c.is_active, c.created_at,
+                   c.rating::REAL AS rating, c.rating_count, c.availability,
+                   (SELECT COUNT(*) FROM shifts s WHERE s.assigned_clinician_id = c.id
+                        AND s.status = 'completed')::BIGINT AS completed_shifts,
+                   cl.latitude  AS latitude,
+                   cl.longitude AS longitude
             FROM clinicians c
             JOIN users u ON c.user_id = u.id
+            LEFT JOIN clinician_locations cl ON cl.clinician_id = c.id
             WHERE c.first_name <> ''
               AND c.last_name <> ''
               AND c.license_number IS NOT NULL

@@ -1,14 +1,103 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    Json,
+};
 use uuid::Uuid;
 use validator::Validate;
 
+use crate::models::clinician::WorkerPublicDetail;
 use crate::models::clinician_registration::{
     AddBankAccountRequest, BankAccountResponse, CompleteProfileRequest, ProfileResponse,
-    SendOtpRequest, SendOtpResponse, VerifyOtpRequest, VerifyOtpResponse,
+    SendOtpRequest, SendOtpResponse, SetAvatarRequest, VerifyOtpRequest, VerifyOtpResponse,
 };
 use crate::routes::AppState;
 use crate::services::clinician_registration_service::ClinicianRegistrationError;
 use crate::utils::errors::{AppError, AppResult};
+use crate::utils::extract_claims;
+
+/// Gate a `/clinicians/{clinician_id}/...` route on the bearer token owning that
+/// profile. The path id is caller-supplied, so without this any authenticated
+/// worker could overwrite another clinician's profile, bank account or avatar.
+async fn require_own_clinician(
+    state: &AppState,
+    headers: &HeaderMap,
+    clinician_id: Uuid,
+) -> Result<(), AppError> {
+    let claims = extract_claims(headers)?;
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| AppError::Unauthorized("Invalid user ID in token".to_string()))?;
+
+    let own = state
+        .clinician_repo
+        .find_id_by_user_id(user_id)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("{e}")))?
+        .ok_or_else(|| {
+            AppError::Forbidden("Authenticated user has no clinician profile".to_string())
+        })?;
+
+    if own != clinician_id {
+        return Err(AppError::Forbidden(
+            "Not your clinician profile".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// GET /api/v1/workers/{id}
+/// Public (ungated) worker profile with rating, completed shifts, verification
+/// and location. Excludes contact, bank-account and earnings (admin-only).
+#[utoipa::path(
+    get,
+    path = "/api/v1/workers/{id}",
+    tag = "clinicians",
+    params(("id" = Uuid, Path, description = "Clinician id")),
+    responses(
+        (status = 200, description = "Worker public profile", body = WorkerPublicDetail),
+        (status = 404, description = "Worker not found")
+    )
+)]
+pub async fn get_worker_public(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<WorkerPublicDetail>> {
+    let worker: Option<WorkerPublicDetail> = sqlx::query_as(
+        r#"
+        SELECT
+            c.id,
+            c.first_name,
+            c.last_name,
+            c.specialty::TEXT      AS specialty,
+            c.role_title,
+            c.license_number,
+            c.rating::REAL         AS rating,
+            c.rating_count,
+            c.acceptance_rate_pct,
+            c.availability::TEXT   AS availability,
+            c.is_verified,
+            c.is_active,
+            EXISTS (SELECT 1 FROM identity_verifications iv
+                WHERE iv.owner_type = 'clinician' AND iv.owner_id = c.id
+                  AND iv.status = 'verified')                                  AS identity_verified,
+            (SELECT COUNT(*) FROM shifts s WHERE s.assigned_clinician_id = c.id
+                AND s.status = 'completed')::BIGINT                            AS completed_shifts,
+            cl.latitude   AS latitude,
+            cl.longitude  AS longitude,
+            c.created_at
+        FROM clinicians c
+        LEFT JOIN clinician_locations cl ON cl.clinician_id = c.id
+        WHERE c.id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let worker = worker.ok_or_else(|| AppError::NotFound(format!("Worker {} not found", id)))?;
+    Ok(Json(worker))
+}
 
 /// POST /api/v1/clinicians/otp/send
 #[utoipa::path(
@@ -77,6 +166,8 @@ pub async fn verify_otp(
     ),
     responses(
         (status = 200, description = "Profile completed successfully", body = ProfileResponse),
+        (status = 401, description = "Missing or invalid token"),
+        (status = 403, description = "Not your clinician profile"),
         (status = 404, description = "Clinician not found"),
         (status = 422, description = "Validation error")
     ),
@@ -87,8 +178,11 @@ pub async fn verify_otp(
 pub async fn complete_profile(
     State(state): State<AppState>,
     axum::extract::Path(clinician_id): axum::extract::Path<Uuid>,
+    headers: HeaderMap,
     Json(req): Json<CompleteProfileRequest>,
 ) -> AppResult<Json<ProfileResponse>> {
+    require_own_clinician(&state, &headers, clinician_id).await?;
+
     req.validate()
         .map_err(|e| AppError::Validation(e.to_string()))?;
 
@@ -110,6 +204,8 @@ pub async fn complete_profile(
     ),
     responses(
         (status = 200, description = "Bank account added successfully", body = BankAccountResponse),
+        (status = 401, description = "Missing or invalid token"),
+        (status = 403, description = "Not your clinician profile"),
         (status = 404, description = "Clinician not found"),
         (status = 422, description = "Bank account validation failed")
     ),
@@ -120,8 +216,11 @@ pub async fn complete_profile(
 pub async fn add_bank_account(
     State(state): State<AppState>,
     axum::extract::Path(clinician_id): axum::extract::Path<Uuid>,
+    headers: HeaderMap,
     Json(req): Json<AddBankAccountRequest>,
 ) -> AppResult<Json<BankAccountResponse>> {
+    require_own_clinician(&state, &headers, clinician_id).await?;
+
     req.validate()
         .map_err(|e| AppError::Validation(e.to_string()))?;
 
@@ -131,6 +230,46 @@ pub async fn add_bank_account(
         .await
         .map(Json)
         .map_err(map_err)
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/clinicians/{clinician_id}/avatar",
+    request_body = SetAvatarRequest,
+    params(("clinician_id" = Uuid, Path, description = "Clinician unique identifier")),
+    responses(
+        (status = 200, description = "Profile image updated"),
+        (status = 401, description = "Missing or invalid token"),
+        (status = 403, description = "Not your clinician profile"),
+        (status = 404, description = "Clinician not found"),
+        (status = 422, description = "Invalid avatar_url")
+    ),
+    tag = "clinicians",
+    summary = "Set clinician profile image (Cloudinary URL)"
+)]
+pub async fn set_avatar(
+    State(state): State<AppState>,
+    Path(clinician_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(req): Json<SetAvatarRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    require_own_clinician(&state, &headers, clinician_id).await?;
+
+    req.validate()
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
+    state
+        .clinician_repo
+        .set_avatar_url(clinician_id, &req.avatar_url)
+        .await
+        .map_err(|e| match e {
+            crate::repositories::clinician::ClinicianRepoError::NotFound => {
+                AppError::NotFound(format!("Clinician {clinician_id} not found"))
+            }
+            other => AppError::Internal(anyhow::anyhow!("{other}")),
+        })?;
+
+    Ok(Json(serde_json::json!({ "avatar_url": req.avatar_url })))
 }
 
 fn map_err(e: ClinicianRegistrationError) -> AppError {
